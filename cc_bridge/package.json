@@ -1,0 +1,19 @@
+{
+  "name": "cc-bridge",
+  "version": "0.1.0",
+  "description": "Bridge Claude Code permission/confirmation prompts to Feishu (Lark) interactive cards",
+  "type": "module",
+  "bin": {
+    "cc-bridge": "./cli.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node cli.mjs serve",
+    "test": "node --test test/e2e.test.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.74.0"
+  }
+}
