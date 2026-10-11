@@ -19,7 +19,8 @@ import {
 import { runHook } from './src/hook-client.mjs';
 import { createBridge } from './src/server.mjs';
 import { createChatRunner } from './src/agent.mjs';
-import { createMessenger, startEventStream } from './src/feishu.mjs';
+// 飞书 SDK 按需加载：install-hooks / status 等客户端命令不依赖 node_modules，
+// client 机器接入远端 daemon 时无需 npm install
 import { buildNotifyCard } from './src/cards.mjs';
 import { log, shortId } from './src/util.mjs';
 
@@ -98,6 +99,7 @@ async function cmdServe(flags) {
     process.exit(1);
   }
 
+  const { createMessenger, startEventStream } = await import('./src/feishu.mjs');
   const messenger = createMessenger(cfg);
   const chat = cfg.chatEnabled
     ? createChatRunner({ cfg, messenger, client: messenger.client })
@@ -228,6 +230,7 @@ async function cmdTest(flags) {
     for (const e of errs) process.stdout.write(`配置问题: ${e}\n`);
     process.exit(1);
   }
+  const { createMessenger } = await import('./src/feishu.mjs');
   const messenger = createMessenger(cfg);
   for (const b of cfg.bindings) {
     const messageId = await messenger.sendCardTo(
