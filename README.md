@@ -18,9 +18,9 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
 
 1. `node cli.mjs install-hooks` 往 Claude Code 的 `settings.json` 写入两类 hook：
    - 确认类 hook：**`PermissionRequest`**（新版 CLI，自动探测；恰好在 Claude Code 要弹权限确认框时触发，已被允许的操作不会重复打扰）或 **`PreToolUse`**（旧版 CLI 回退，每次工具调用都触发）。hook 进程把工具调用详情 POST 给 daemon 并**阻塞等待**；daemon 发一张带选项按钮的卡片到飞书，你点击后决策以 hook JSON 返回，Claude Code 据此放行或拒绝（拒绝原因会告知 Claude，它会调整方案）。
-   - `Notification`（可选）：Claude 空闲等待输入等通知，转发为纯通知卡片。其中 `permission_prompt` 类通知（确认框闲置 ~6s 才触发）**在该会话已有挂起确认卡或刚被点击解决的 60s 内自动抑制**，避免与交互确认卡重复打扰；仅当 cc-bridge 未接管审批（发卡失败/并发超限回退本地确认）时才转发，作为手机端唯一提醒。
+   - `Notification`（可选）：Claude 空闲等待输入等通知，转发为纯通知卡片。其中 `permission_prompt` 类通知（确认框闲置 ~6s 才触发）**在该会话已有挂起确认卡或刚被点击解决的 60s 内自动抑制**，避免与交互确认卡重复打扰；仅当 cc-bridge 未接管审批（发卡失败/并发超限回退本地确认）时才转发，作为手机端唯一提醒。`idle_prompt`（"Claude is waiting for your input"）**在该会话发过「🏁 已完成」输出卡的 10 分钟内同样抑制**（输出卡已带最终回复）。
 2. 超时（默认 300s）未响应 → 返回空决策，交互式会话回退为本地正常确认流程（**fail-open**，bridge 挂掉也不影响 Claude Code 使用）。注意：headless 等无法弹框的会话中，Claude Code 对「无决策」本身会拒绝该工具调用——手机审批就是这类会话唯一的人工通道。
-3. **终端本地作答联动**：Claude Code 不会因为你在终端本地回答了确认框而通知任何 hook（hook 进程与飞书卡片都会继续挂着），daemon 靠 `install-hooks` 一并安装的 `PostToolUse` / `Stop` 两个事件感知本地作答：同会话同工具同参数的工具确实执行了（PostToolUse，键序无关严格匹配，防并行同工具任务误伤）→ 卡片刷成「🖥️ 已在终端允许」；回合结束（Stop）→ 该会话剩余挂起卡片一律刷成「🖥️ 已在终端处理」（本地拒绝 / Esc 取消的兜底）。结算同时向仍挂起的 hook 连接回空体释放进程，卡片按钮随之失效。`Stop` 的「🏁 任务完成」通知默认关闭（`notifyStop: true` 打开）。
+3. **终端本地作答联动**：Claude Code 不会因为你在终端本地回答了确认框而通知任何 hook（hook 进程与飞书卡片都会继续挂着），daemon 靠 `install-hooks` 一并安装的 `PostToolUse` / `Stop` 两个事件感知本地作答：同会话同工具同参数的工具确实执行了（PostToolUse，键序无关严格匹配，防并行同工具任务误伤）→ 卡片刷成「🖥️ 已在终端允许」；回合结束（Stop）→ 该会话剩余挂起卡片一律刷成「🖥️ 已在终端处理」（本地拒绝 / Esc 取消的兜底）。结算同时向仍挂起的 hook 连接回空体释放进程，卡片按钮随之失效。`Stop` 还会推「🏁 已完成，等待输入」卡片，**内容即该回合的最终输出**（读 `transcript_path` 里最后一条 assistant 文本——飞书群里的最后一张卡不再是 "waiting for your input" 空话；远程机器路径读不到时退化为通用文案，`notifyStop: false` 关闭）。消息驱动会话的 Stop 不推（回复卡片已带结果）。
 4. **选项与终端确认框一一对应**：Claude Code 在 `permission_suggestions` 里给出确认框的选项建议，卡片按 cli.js 同款模板渲染为编号按钮（`1. Yes` / `2. Yes, and don't ask again for: <命令>` / …，个数与文案与终端一致）。飞书按钮无对齐属性、按渲染像素折行且居中（折行会把首行「Yes」顶偏），文本硬上限 100 字符，因此按钮文案按单行预算（Mac 端估 ~72-78 字符，取 70）**词边界截断加 `…`**；放不下的完整详情左对齐补在按钮上方的正文里，编号与按钮对应。点建议行 = 全部建议原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**；点 auto 行 = 回传 `setMode{auto, session}` 切换会话权限模式。终端上「switch to auto mode」选项本身不带建议条目（UI 自加），卡片据 `permission_mode`（default/acceptEdits 时提供）复原该选项。
    无 `permission_suggestions` 的确认框（如文件编辑类，不读该数组）或旧 CLI 回退为固定三键「✅ 允许 / 👍 总是允许（cc-bridge 内部规则，Bash 按首命令、文件工具按目录，daemon 重启清空）/ ❌ 拒绝」。
 5. **消息驱动 Claude Code**（`chatEnabled`，默认开）：在配置文件 `bindings` 里声明「群 ↔ 目录」绑定后，**绑定群里的文本消息免 @ 自动执行**，等价于在绑定目录的终端 `claude` cli 里输入（单聊不驱动执行）。daemon 收到消息后立刻回一张「🚀 处理中」回执卡，用 `claude -p --output-format json [--resume <sid>]` 无头执行（每个群保留各自上下文），跑完把回执卡更新为回复内容（含耗时/轮数/费用）。同一群串行执行（排队时回执显示「已排队」）。执行过程中的权限确认走上面的交互卡片，并按 `cwd` 路由回**该群**。发「**新会话**」（或 `/new`）丢弃上下文重来；未绑定的群 @机器人 会回复配置提示。这些消息驱动的会话不再收「任务完成」重复通知。
@@ -99,7 +99,7 @@ daemon 机器把配置 `host` 改为 `0.0.0.0`（并设置 `token`）后 `./serv
 | `token` | 空 | hook 客户端与 daemon 之间的 Bearer 共享密钥（跨机器必设） |
 | `allowedOpenIds` | `[]` | 允许点按钮/发指令的飞书用户，空为不限制（**开启消息驱动建议配置**，否则绑定群里的任何人都能在你机器上跑 claude） |
 | `allow` | `[]` | 预置免确认规则，如 `["Bash:git", "Edit:/src", "WebFetch"]` |
-| `notifyStop` | `false` | Stop 事件额外发「🏁 任务完成」通知卡（每回合一条，默认关；Stop hook 本身始终安装，用于终端本地作答联动） |
+| `notifyStop` | `true` | Stop 事件推「🏁 已完成」卡，内容为该回合最终输出（读 transcript 最后一条 assistant 文本，读不到退化为通用文案）；发出后 10 分钟内抑制该会话的 idle_prompt 空闲提醒 |
 | `domain` | `feishu` | `lark` 为国际版 |
 | `wsPingTimeoutSec` | `120` | 飞书长连接看门狗（秒）：ping 后该窗口内收不到任何入站帧即判定连接死亡并主动重连。半开连接不报 socket 错误，关掉它会出现「卡片照发、点击全丢」的假活状态 |
 | `chatEnabled` | `true` | 飞书消息驱动 Claude Code（按 `bindings` 绑定的群触发） |
@@ -116,7 +116,7 @@ daemon 机器把配置 `host` 改为 `0.0.0.0`（并设置 `token`）后 `./serv
 | `POST /hook/permissionrequest` `POST /hook/pretooluse` | 确认类 hook 的 stdin JSON → 挂起等待决策；响应体即 hook stdout（空 = 无意见），按事件返回对应决策 schema |
 | `POST /hook/posttooluse` | 工具已执行 → 严格匹配（会话+工具+参数）结算对应挂起确认，卡片刷为「已在终端允许」；本身不挂起、不发卡 |
 | `POST /hook/notification` | 转通知卡片 |
-| `POST /hook/stop` | 回合结束 → 该会话挂起确认结算为「已在终端处理」；`notifyStop: true` 时另发「任务完成」卡 |
+| `POST /hook/stop` | 回合结束 → 该会话挂起确认结算为「已在终端处理」；另推「🏁 已完成」输出卡（内容 = 该回合最终输出，`notifyStop: false` 关闭） |
 | `POST /notify` | `{title, body, severity}` 手动推送卡片 |
 | `GET /health` | 状态（免鉴权） |
 | `GET/DELETE /rules` | 查看 / 清空免确认规则 |
@@ -165,6 +165,7 @@ WantedBy=default.target
 
 - **fail-open**：daemon 未启动、网络断开、发卡失败、超时，一律返回空决策（exit 0、无 stdout），Claude Code 回退原生确认流程，永远不会因为 bridge 故障卡死。
 - **本地作答感知**：Claude Code 的 hook 体系没有「确认框已被本地回答」的事件，也不会杀掉仍在阻塞的 hook 进程，因此用 `PostToolUse`（工具确实执行 = 本地允许）与 `Stop`（回合结束 = 兜底）推断；卡片状态翻转走飞书官方「更新已发送的消息卡片」接口（`PATCH /im/v1/messages/:message_id`，前后卡片均声明 `update_multi: true`）。
+- **回合输出卡**：Stop payload 自带 `transcript_path`（会话 JSONL），从后向前取最后一条 assistant 文本即为该回合最终输出；读不到（远程机器的本地路径）时退化为通用文案。
 - **顺序与超时对齐**：hook 配置 `timeout: 600` > daemon `timeoutSec`（≤580），保证先由 daemon 超时返回、Claude Code 不会先杀 hook。
 - 决策 schema 按事件区分（均已对照官方 hooks 文档核实）：`PreToolUse` 返回 `hookSpecificOutput.permissionDecision`（allow/deny）；`PermissionRequest` 返回 `hookSpecificOutput.decision.behavior`（allow/deny），`deny` 的原因/消息会反馈给 Claude，建议行/auto 行通过 `decision.updatedPermissions`（数组）回传原生权限更新（addRules / setMode 等，字段见 hooks 文档「Permission update entries」）。
 - 挂起请求用 HTTP 长轮询实现，hook 进程无需额外状态；同一卡片重复回调按 rid 幂等处理。

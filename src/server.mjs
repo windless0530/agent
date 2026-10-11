@@ -1,5 +1,6 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { log, truncate, shortId } from './util.mjs';
 import { extractText } from './agent.mjs';
@@ -95,6 +96,7 @@ function readBody(req, limit = 1024 * 1024) {
 export function createBridge({ cfg, messenger, chat = null }) {
   const pending = new Map(); // rid -> { res, messageId, meta, timer, settled }
   const recentResolved = new Map(); // session_id -> resolve 时间戳（抑制迟到的 permission_prompt 通知）
+  const recentStop = new Map(); // session_id -> Stop 输出卡时间戳（抑制其后的 idle_prompt 空闲提醒）
   const allowRules = parseSeedRules(cfg.allow);
   const state = { ws: 'init', startedAt: Date.now(), wsStatusProvider: null };
 
@@ -228,6 +230,35 @@ export function createBridge({ cfg, messenger, chat = null }) {
     return matches.length;
   }
 
+  /** 从会话 transcript（JSONL）取最后一条 assistant 文本消息，即该回合的最终输出。
+   *  Stop 触发时 transcript 已写完整回合；从后向前找，跳过纯 tool_use / 坏行。
+   *  远程机器的本地路径读不到时返回空（退化为通用文案）。 */
+  function lastAssistantText(transcriptPath) {
+    if (!transcriptPath || typeof transcriptPath !== 'string') return '';
+    try {
+      const lines = fs.readFileSync(transcriptPath, 'utf8').trimEnd().split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        let entry;
+        try {
+          entry = JSON.parse(lines[i]);
+        } catch {
+          continue; // 半行 / 坏行
+        }
+        if (entry?.type !== 'assistant') continue;
+        const blocks = entry.message?.content;
+        const texts = Array.isArray(blocks)
+          ? blocks.filter((b) => b?.type === 'text' && b.text).map((b) => b.text)
+          : typeof blocks === 'string' && blocks
+            ? [blocks]
+            : [];
+        if (texts.length) return texts.join('\n').trim();
+      }
+    } catch {
+      // 路径不存在（远程机器）/ 无权限 → 空串
+    }
+    return '';
+  }
+
 
   // ---------- hook 事件处理 ----------
 
@@ -303,30 +334,65 @@ export function createBridge({ cfg, messenger, chat = null }) {
   }
 
   async function handleAlertEvent(req, res, payload, event) {
-    const isStop = event === 'stop';
-    if (isStop) {
+    if (event === 'stop') {
       // 回合结束：该会话仍挂起的确认视为已在终端本地处理（允许/拒绝/Esc 的统一兜底）
       const n = settleLocalFromStop(payload);
       if (n) log('resolve', `Stop：会话 ${shortId(payload.session_id)} 的 ${n} 个挂起确认已在终端处理`);
-      // 飞书消息驱动的会话：结果由聊天里的回复卡片给出，Stop 的「任务完成」通知纯重复
+      // 飞书消息驱动的会话：结果由聊天里的回复卡片给出，Stop 卡纯重复
       if (payload.__fromChat === 1) {
         return sendJson(res, 200, '');
       }
-      // 「任务完成」通知默认关（每回合一条纯属打扰），notifyStop: true 打开
-      if (!cfg.notifyStop) return sendJson(res, 200, '');
+      // 「任务完成」卡（notifyStop: false 关闭，默认开）：内容为该回合最终输出
+      // （读 transcript 最后一条 assistant 文本），读不到时退化为通用文案
+      if (cfg.notifyStop !== false) {
+        const output = lastAssistantText(payload.transcript_path);
+        if (payload.session_id) recentStop.set(payload.session_id, Date.now());
+        try {
+          const messageId = await sendCardRouted(
+            payload.cwd,
+            buildNotifyCard({
+              title: '🏁 Claude Code 已完成，等待输入',
+              message: output || '回合结束，已在终端等待输入。',
+              cwd: payload.cwd,
+              severity: 'success',
+            }),
+          );
+          if (messageId) {
+            log('card', `Stop 输出卡 message_id=${messageId}${output ? '' : '（未读到 transcript，通用文案）'}`);
+          } else {
+            log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，跳过 Stop 输出卡`);
+          }
+        } catch (e) {
+          log('error', '发送 Stop 输出卡失败:', e.message);
+        }
+      }
+      return sendJson(res, 200, '');
     }
-    // permission_prompt 类通知在确认框闲置 ~6s 后才触发：此时若该会话已有挂起的
-    // 交互确认卡（cc-bridge 已接管审批）或刚被点击解决，纯通知卡纯属重复打扰，抑制；
-    // 若两者皆无（发卡失败/并发超限回退本地确认），保留通知作为手机端唯一提醒。
-    if (event === 'notification' && payload.notification_type === 'permission_prompt') {
-      const recently = Date.now() - (recentResolved.get(payload.session_id) || 0) < 60_000;
-      const hasPending = [...pending.values()].some((e) => e.meta.session === payload.session_id);
-      if (hasPending || recently) {
-        log('notify', `抑制 permission_prompt 通知（会话 ${String(payload.session_id || '').slice(0, 8)} 已由确认卡接管）`);
+    if (event === 'notification') {
+      // idle_prompt（"Claude is waiting for your input"）：刚发过 Stop 输出卡的会话
+      // 已在等输入且卡片带走了最终回复，10 分钟内抑制；消息驱动的会话同理（结果卡已回复）
+      const idle =
+        payload.notification_type === 'idle_prompt' ||
+        /waiting for your input/i.test(String(payload.message || ''));
+      const stoppedRecently =
+        Date.now() - (recentStop.get(payload.session_id) || 0) < 600_000;
+      if (idle && (payload.__fromChat === 1 || (payload.session_id && stoppedRecently))) {
+        log('notify', `抑制 idle_prompt 通知（会话 ${shortId(payload.session_id || '')} 已有回合输出卡）`);
         return sendJson(res, 200, '');
       }
+      // permission_prompt 类通知在确认框闲置 ~6s 后才触发：此时若该会话已有挂起的
+      // 交互确认卡（cc-bridge 已接管审批）或刚被点击解决，纯通知卡纯属重复打扰，抑制；
+      // 若两者皆无（发卡失败/并发超限回退本地确认），保留通知作为手机端唯一提醒。
+      if (payload.notification_type === 'permission_prompt') {
+        const recently = Date.now() - (recentResolved.get(payload.session_id) || 0) < 60_000;
+        const hasPending = [...pending.values()].some((e) => e.meta.session === payload.session_id);
+        if (hasPending || recently) {
+          log('notify', `抑制 permission_prompt 通知（会话 ${String(payload.session_id || '').slice(0, 8)} 已由确认卡接管）`);
+          return sendJson(res, 200, '');
+        }
+      }
     }
-    const title = isStop ? '🏁 Claude Code 已完成任务' : '🔔 Claude Code 通知';
+    const title = '🔔 Claude Code 通知';
     const message =
       payload.message || payload.__raw || payload.title || '(无内容)';
     try {
@@ -336,7 +402,7 @@ export function createBridge({ cfg, messenger, chat = null }) {
           title,
           message,
           cwd: payload.cwd,
-          severity: isStop ? 'success' : 'info',
+          severity: 'info',
         }),
       );
       if (messageId) log('card', `通知卡 ${event} message_id=${messageId}`);

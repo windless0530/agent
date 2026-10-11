@@ -23,9 +23,11 @@ export const DEFAULTS = {
   allowedOpenIds: [],
   /** 启动时预置的免确认规则，形如 "Bash:git" / "Write" / "Edit:/src" */
   allow: [],
-  /** Stop 事件是否额外发「任务完成」通知卡（默认关：每回合一条纯打扰；
-   *  Stop hook 本身始终安装，用于感知终端本地作答并把挂起卡片刷成已处理态） */
-  notifyStop: false,
+  /** Stop 事件是否发「🏁 已完成」卡：内容为该回合最终输出（读 transcript 最后一条
+   *  assistant 文本，远程机器读不到时退化为通用文案）；发出后 10 分钟内抑制该会话的
+   *  idle_prompt（"waiting for your input"）提醒。Stop hook 本身始终安装，
+   *  还用于感知终端本地作答并把挂起卡片刷成已处理态 */
+  notifyStop: true,
   /** 飞书消息驱动 Claude Code 开关（按 bindings 绑定的群触发） */
   chatEnabled: true,
   /** claude 可执行文件，默认 PATH 上的 claude */

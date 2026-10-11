@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createBridge } from '../src/server.mjs';
 import { loadConfig, validateServeConfig } from '../src/config.mjs';
 import { createChatRunner, extractText } from '../src/agent.mjs';
@@ -291,7 +294,10 @@ test('终端本地作答：PostToolUse 严格匹配 → 结算挂起并刷卡；
     assert.equal(t.bridge.pendingSize(), 0);
     assert.match(t.messenger.updates[1].card.header.title.content, /已在终端处理/);
     assert.equal(t.messenger.updates[1].card.header.template, 'grey');
-    assert.equal(t.messenger.sent.length, 2); // 只有确认卡，无 stop 通知卡（notifyStop 默认关）
+    // notifyStop 默认开：每次 Stop 另发「已完成」卡（含上面探测用的其它会话）
+    assert.equal(t.messenger.sent.length, 4); // 2 确认卡 + 2 张 stop 输出卡（无 transcript → 通用文案）
+    assert.match(t.messenger.sent[3].header.title.content, /已完成/);
+    assert.equal(t.messenger.sent[3].header.template, 'green');
   } finally {
     await t.close();
   }
@@ -352,23 +358,25 @@ test('token 鉴权：无凭据 401，带 Bearer 正常', async () => {
 test('notification / stop / notify 事件：按 binding 路由发卡；未命中不发也不挂起', async () => {
   const t = await startBridge({ timeoutSec: 30 });
   try {
+    // 无 session_id 的空闲提醒：没发过 Stop 输出卡 → 照常转发
     const n = await post(t.base, '/hook/notification', { message: 'Claude is waiting for your input', cwd: '/home/user/project' });
     assert.equal((await n.text()).trim(), '');
-    // notifyStop 默认关：Stop 只用于结算挂起确认，不发「任务完成」卡
+    // notifyStop 默认开：Stop 发「已完成」卡（无 transcript → 通用文案）
     const s = await post(t.base, '/hook/stop', { cwd: '/home/user/project' });
     assert.equal((await s.text()).trim(), '');
     const m = await post(t.base, '/notify', { title: '手动通知', body: 'hello', severity: 'warn', cwd: '/home/user/project' });
     const mj = JSON.parse(await m.text());
     assert.equal(mj.ok, true);
-    assert.equal(t.messenger.sent.length, 2); // 通知卡 + 手动通知卡，无 stop 卡
-    assert.equal(t.messenger.sent[1].header.template, 'orange'); // severity warn
+    assert.equal(t.messenger.sent.length, 3); // 空闲提醒 + stop 卡 + 手动通知卡
+    assert.match(t.messenger.sent[1].header.title.content, /已完成/);
+    assert.equal(t.messenger.sent[2].header.template, 'orange'); // severity warn
     assert.ok(t.messenger.sentTo.every((x) => x.chatId === 'oc_t')); // 全部路由到默认绑定群
     assert.equal(t.bridge.pendingSize(), 0);
 
     // 未命中 binding：通知事件静默跳过（不发卡），/notify 明确报 400
     const n2 = await post(t.base, '/hook/notification', { message: 'x', cwd: '/elsewhere' });
     assert.equal((await n2.text()).trim(), '');
-    assert.equal(t.messenger.sent.length, 2);
+    assert.equal(t.messenger.sent.length, 3);
     const bad = await post(t.base, '/notify', { title: 'x', body: 'y', cwd: '/elsewhere' });
     assert.equal(bad.status, 400);
   } finally {
@@ -376,14 +384,73 @@ test('notification / stop / notify 事件：按 binding 路由发卡；未命中
   }
 });
 
-test('notifyStop: true 时 Stop 事件发「任务完成」通知卡', async () => {
-  const t = await startBridge({ timeoutSec: 30, notifyStop: true });
+test('Stop 输出卡：内容为 transcript 最后一条 assistant 文本；其后 idle_prompt 抑制', async () => {
+  // 构造 transcript：末尾是纯 tool_use 行与坏行，都应被跳过
+  const transcript = path.join(os.tmpdir(), `cc-bridge-stop-${process.pid}-${Date.now()}.jsonl`);
+  fs.writeFileSync(
+    transcript,
+    [
+      JSON.stringify({ type: 'user', message: { content: '跑一下' } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '中间步骤输出' }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash' }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '完成。现在的规则：xxx' }] } }),
+      '{broken json',
+    ].join('\n') + '\n',
+  );
+  const t = await startBridge({ timeoutSec: 30 });
   try {
-    const s = await post(t.base, '/hook/stop', { cwd: '/home/user/project', session_id: 'sess-none' });
+    const s = await post(t.base, '/hook/stop', {
+      session_id: 'sess-stop-1',
+      cwd: '/home/user/project',
+      transcript_path: transcript,
+    });
     assert.equal((await s.text()).trim(), '');
     assert.equal(t.messenger.sent.length, 1);
-    assert.match(t.messenger.sent[0].header.title.content, /完成/);
-    assert.equal(t.messenger.sent[0].header.template, 'green');
+    const card = t.messenger.sent[0];
+    assert.match(card.header.title.content, /已完成/);
+    assert.equal(card.header.template, 'green');
+    assert.match(card.body.elements[0].content, /完成。现在的规则：xxx/);
+    assert.doesNotMatch(card.body.elements[0].content, /中间步骤输出/);
+
+    // 同会话随后的 idle_prompt（waiting for your input）被抑制——不再是最后那张废话卡
+    const idle = await post(t.base, '/hook/notification', {
+      notification_type: 'idle_prompt',
+      message: 'Claude is waiting for your input',
+      session_id: 'sess-stop-1',
+      cwd: '/home/user/project',
+    });
+    assert.equal((await idle.text()).trim(), '');
+    assert.equal(t.messenger.sent.length, 1);
+
+    // 没发过 Stop 卡的会话照常转发
+    await post(t.base, '/hook/notification', {
+      notification_type: 'idle_prompt',
+      message: 'Claude is waiting for your input',
+      session_id: 'sess-idle-other',
+      cwd: '/home/user/project',
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(t.messenger.sent.length, 2);
+  } finally {
+    fs.unlinkSync(transcript);
+    await t.close();
+  }
+});
+
+test('notifyStop: false 时不发 Stop 卡，其后的 idle 提醒也不再抑制', async () => {
+  const t = await startBridge({ timeoutSec: 30, notifyStop: false });
+  try {
+    const s = await post(t.base, '/hook/stop', { cwd: '/home/user/project', session_id: 'sess-q' });
+    assert.equal((await s.text()).trim(), '');
+    assert.equal(t.messenger.sent.length, 0);
+    await post(t.base, '/hook/notification', {
+      notification_type: 'idle_prompt',
+      message: 'Claude is waiting for your input',
+      session_id: 'sess-q',
+      cwd: '/home/user/project',
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(t.messenger.sent.length, 1); // 没有输出卡 → 空闲提醒照常转发
   } finally {
     await t.close();
   }
