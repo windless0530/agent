@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createBridge } from '../src/server.mjs';
+import { parseDialogOptions, dialogHasAutoRow } from '../src/dialog.mjs';
 import { loadConfig, validateServeConfig } from '../src/config.mjs';
 import { createChatRunner, extractText } from '../src/agent.mjs';
 import {
@@ -124,12 +125,13 @@ function fakeRunClaude(runs, resultOf) {
 /** 默认绑定：BASH_PAYLOAD / PR_PAYLOAD 的 cwd 都在 /home/user/project 下 */
 const DEFAULT_BINDING = { chatId: 'oc_t', cwd: '/home/user/project' };
 
-async function startBridge(cfg = {}) {
+async function startBridge(cfg = {}, paneReader = async () => '') {
   const messenger = fakeMessenger();
   const merged = { ...cfg, bindings: [...(cfg.bindings || []), DEFAULT_BINDING] };
-  // 卡片路由依赖 chat runner 的 chatForCwd，必须一并挂上
+  // 卡片路由依赖 chat runner 的 chatForCwd，必须一并挂上；paneReader 默认读不到
+  // （非 herdr 会话），保证权限类测试不依赖本机真实终端
   const chat = createChatRunner({ herdr: fakeHerdr(), cfg: merged, messenger, client: fakeLarkClient() });
-  const bridge = createBridge({ cfg: merged, messenger, chat });
+  const bridge = createBridge({ cfg: merged, messenger, chat, paneReader });
   await new Promise((resolve) => bridge.server.listen(0, '127.0.0.1', resolve));
   const { port } = bridge.server.address();
   return { bridge, messenger, base: `http://127.0.0.1:${port}`, async close() { bridge.server.close(); } };
@@ -592,7 +594,7 @@ test('PermissionRequest：允许/拒绝返回 decision schema', async () => {
   }
 });
 
-test('PermissionRequest：选项个数/文案与终端确认框一致（Yes / 合并建议行 / auto / No）', async () => {
+test('PermissionRequest：选项个数/文案与终端确认框一致（Yes / 合并建议行 / No）', async () => {
   const t = await startBridge({ timeoutSec: 30 });
   try {
     // 场景对齐用户实例：单条 Bash addRules 建议
@@ -604,20 +606,18 @@ test('PermissionRequest：选项个数/文案与终端确认框一致（Yes / �
     await new Promise((r) => setTimeout(r, 150));
     const card = t.messenger.sent[0];
     const btns = card.body.elements.filter((e) => e.tag === 'button');
-    assert.equal(btns.length, 4); // Yes / 建议行 / auto 行 / No，与终端 4 选项一致
+    assert.equal(btns.length, 3); // Yes / 建议行 / No，与终端一致
     // 短规则（52 字符）整条放得进单行预算 → 按钮即终端原话，正文无需补全
     assert.equal(btns[0].text.content, '1. Yes');
-    assert.equal(btns[1].text.content, `2. Yes, and don't ask again for: rm -rf node_modules`);
-    assert.equal(btns[3].text.content, '4. No');
-    // 超预算的 auto 行（73 字符）词边界截断，正文补全完整说明
-    assert.match(btns[2].text.content, /^3\. Yes, and switch to auto mode/);
-    assert.ok(btns[2].text.content.endsWith('…'));
+    assert.equal(btns[1].text.content, `2. Yes, and don’t ask again for: rm -rf node_modules`);
+    assert.equal(btns[2].text.content, '3. No');
     for (const b of btns) assert.ok(b.text.content.length <= 100);
-    assert.doesNotMatch(card.body.elements[0].content, /2\. don't ask again/);
+    assert.doesNotMatch(card.body.elements[0].content, /2\. don’t ask again/);
     assert.match(card.body.elements[0].content, /Do you want to proceed\?/);
-    assert.match(card.body.elements[0].content, /3\. auto mode handles these prompts for you/);
+    // paneReader 读不到（默认）→ 不出 auto 行
+    assert.ok(!btns.some((b) => /switch to auto mode/.test(b.text.content)));
     assert.equal(btns[1].behaviors[0].value.act, 'suggest');
-    assert.equal(btns[2].behaviors[0].value.act, 'auto');
+    assert.equal(btns[2].behaviors[0].value.act, 'deny');
 
     // 点建议行：全部建议原样回传（yes-apply-suggestions 语义）
     await t.bridge.handleCardAction({
@@ -633,35 +633,121 @@ test('PermissionRequest：选项个数/文案与终端确认框一致（Yes / �
   }
 });
 
-test('PermissionRequest：点 auto 选项 → 回传 setMode{auto,session}；模式门控对齐 cli.js', async () => {
-  const t = await startBridge({ timeoutSec: 30 });
+/** 终端确认框实抓样本（claude 2.1.296，220 列 tmux）——读屏对齐的 ground truth */
+const DIALOG_WITH_AUTO = ` Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Fetch the example.com page content
+╌╌╌╌╌╌╌╌╌╌
+ curl -s https://example.com
+╌╌╌╌╌╌╌╌╌╌
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: curl *
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend`;
+
+/** manual 模式形态：Tip 行含目标字样但选项列表没有 auto 行（不得全文子串误判） */
+const DIALOG_WITHOUT_AUTO = ` Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: curl *
+   3. No
+
+ Esc to cancel · Tab to amend`;
+
+/** 窄终端：选项折行，折行内容并入所属选项 */
+const DIALOG_WRAPPED = ` Edit file
+ This file requires approval
+
+ Do you want to make this edit?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for
+ this session
+   3. No
+
+ Esc to cancel · Tab to amend`;
+
+test('parseDialogOptions：真实样本逐行解析；Tip 行不误判；折行合并；非对话框返回空', () => {
+  const opts = parseDialogOptions(DIALOG_WITH_AUTO);
+  assert.equal(opts.length, 4);
+  assert.equal(opts[0], 'Yes');
+  assert.equal(opts[1], 'Yes, and don’t ask again for: curl *');
+  assert.equal(opts[3], 'No');
+  assert.ok(dialogHasAutoRow(opts));
+
+  const manual = parseDialogOptions(DIALOG_WITHOUT_AUTO);
+  assert.equal(manual.length, 3);
+  assert.ok(!dialogHasAutoRow(manual), 'Tip 行含字样但选项无 auto 行 → 不得误判');
+
+  const wrapped = parseDialogOptions(DIALOG_WRAPPED);
+  assert.equal(wrapped.length, 3);
+  assert.match(wrapped[1], /for this session$/);
+
+  assert.deepEqual(parseDialogOptions('❯ 随便一段终端输出\n没有对话框'), []);
+  assert.deepEqual(parseDialogOptions(''), []);
+});
+
+test('auto 模式行读屏对齐：终端渲染了 → 卡片出该键并回传 setMode；没渲染/读不到 → 不出', async () => {
+  // 1) 终端有 auto 行 → 卡片 4 键；点它回传 setMode{auto, session}
+  let t = await startBridge({ timeoutSec: 30 }, async () => DIALOG_WITH_AUTO);
   try {
-    let p = post(t.base, '/hook/permissionrequest', PR_PAYLOAD); // permission_mode 缺省按 default
+    const p = post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      permission_suggestions: PR_PAYLOAD.permission_suggestions.slice(0, 1),
+    });
     await new Promise((r) => setTimeout(r, 150));
-    let rid = clickRid(t.messenger.sent[0], 'auto');
-    await t.bridge.handleCardAction({ action: { value: { rid, act: 'auto' } }, operator: { open_id: 'ou_u' } });
-    let j = JSON.parse(await (await p).text());
+    const card = t.messenger.sent[0];
+    const btns = card.body.elements.filter((e) => e.tag === 'button');
+    assert.equal(btns.length, 4);
+    assert.match(btns[2].text.content, /^3\. Yes, and switch to auto mode/);
+    assert.equal(btns[2].behaviors[0].value.act, 'auto');
+    await t.bridge.handleCardAction({
+      action: { value: { rid: clickRid(card, 'auto'), act: 'auto' } },
+      operator: { open_id: 'ou_u' },
+    });
+    const j = JSON.parse(await (await p).text());
     assert.deepEqual(j.hookSpecificOutput.decision.updatedPermissions, [
       { type: 'setMode', mode: 'auto', destination: 'session' },
     ]);
     assert.match(JSON.stringify(t.messenger.updates[0].card), /切换权限模式/);
+  } finally {
+    await t.close();
+  }
 
-    // acceptEdits 下也提供 auto（对齐 cli.js wTt 条件）
-    p = post(t.base, '/hook/permissionrequest', { ...PR_PAYLOAD, permission_mode: 'acceptEdits' });
+  // 2) 终端没有 auto 行（manual 模式 + Tip 干扰）→ 卡片 3 键
+  t = await startBridge({ timeoutSec: 2 }, async () => DIALOG_WITHOUT_AUTO);
+  try {
+    const p = post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      permission_suggestions: PR_PAYLOAD.permission_suggestions.slice(0, 1),
+    });
     await new Promise((r) => setTimeout(r, 150));
-    assert.ok(clickRid(t.messenger.sent[1], 'auto'));
+    const btns = t.messenger.sent[0].body.elements.filter((e) => e.tag === 'button');
+    assert.equal(btns.length, 3);
+    assert.ok(!btns.some((b) => /switch to auto mode/.test(b.text.content)));
+    await (await p).text(); // 超时结算，释放挂起连接
+  } finally {
+    await t.close();
+  }
 
-    // plan 模式不提供 auto
-    p = post(t.base, '/hook/permissionrequest', { ...PR_PAYLOAD, permission_mode: 'plan' });
+  // 3) 读不到 pane（非 herdr 会话 / 远程机器）→ 不出 auto 行
+  t = await startBridge({ timeoutSec: 2 }, async () => '');
+  try {
+    const p = post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      permission_suggestions: PR_PAYLOAD.permission_suggestions.slice(0, 1),
+    });
     await new Promise((r) => setTimeout(r, 150));
-    const acts = t.messenger.sent[2].body.elements
-      .filter((e) => e.tag === 'button')
-      .map((b) => b.behaviors[0].value.act);
-    assert.deepEqual(acts, ['allow', 'suggest', 'deny']);
-    rid = clickRid(t.messenger.sent[2], 'deny');
-    await t.bridge.handleCardAction({ action: { value: { rid, act: 'deny' } }, operator: { open_id: 'ou_u' } });
-    j = JSON.parse(await (await p).text());
-    assert.equal(j.hookSpecificOutput.decision.behavior, 'deny');
+    const btns = t.messenger.sent[0].body.elements.filter((e) => e.tag === 'button');
+    assert.equal(btns.length, 3);
+    await (await p).text();
   } finally {
     await t.close();
   }
@@ -697,12 +783,12 @@ test('PermissionRequest：建议合并行按建议内容选 cli.js 模板；垃�
     });
     await new Promise((r) => setTimeout(r, 150));
     btn = t.messenger.sent[1].body.elements.find((e) => e.behaviors?.[0]?.value?.act === 'suggest');
-    assert.ok(btn.text.content.startsWith("2. Yes, and don't ask again for example.com"));
+    assert.ok(btn.text.content.startsWith("2. Yes, and don’t ask again for example.com"));
     assert.ok(btn.text.content.endsWith('…'));
     assert.ok(btn.text.content.length <= 71);
     assert.match(
       t.messenger.sent[1].body.elements[0].content,
-      /2\. don't ask again for example\.com in any project \(user settings\)/,
+      /2\. don’t ask again for example\.com in any project \(user settings\)/,
     );
 
     // 无 suggestions（Edit 对话框不读该数组 / 旧 CLI）→ 固定三键，含「总是允许」
@@ -903,16 +989,17 @@ function newRunner({ cfg = {}, client = fakeLarkClient(), runClaude } = {}) {
 test('消息驱动：绑定群消息免 @ 执行（在绑定目录跑 claude）；单聊忽略；会话延续', async () => {
   const { runner, messenger, runs } = newRunner();
   await runner.handleMessage(msgEvent({ chatType: 'group', text: ' 查看git状态 ' }));
-  await waitFor(() => messenger.updates.length === 1);
+  await waitFor(() => messenger.replies.length === 2);
   assert.equal(runs.length, 1);
   assert.equal(runs[0].prompt, '查看git状态'); // 压缩空白
   assert.equal(runs[0].cwd, '/repo/a'); // 在绑定目录执行
   assert.equal(runs[0].sessionId, ''); // 首条无会话
   assert.equal(runs[0].env.CC_BRIDGE_FROM_CHAT, '1');
-  // 回执卡片先发（蓝色处理中），跑完 patch 成结果卡片（绿色含回复）
+  // 回执卡先发（蓝色「已开始」），跑完另发结果卡片（绿色含回复），回执不再改动
   assert.equal(messenger.replies[0].card.header.template, 'blue');
-  assert.equal(messenger.updates[0].card.header.template, 'green');
-  assert.match(messenger.updates[0].card.body.elements[0].content, /echo:查看git状态/);
+  assert.match(messenger.replies[0].card.header.title.content, /已开始/);
+  assert.equal(messenger.replies[1].card.header.template, 'green');
+  assert.match(messenger.replies[1].card.body.elements[0].content, /echo:查看git状态/);
 
   // 第二条消息带上一条的 session_id（上下文延续）
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '继续' }));
@@ -1028,10 +1115,12 @@ test('消息驱动：同一会话串行排队，busy 期间回执标记排队', 
   release();
   await waitFor(() => order.length === 4);
   assert.deepEqual(order, ['start:一', 'end:一', 'start:二', 'end:二']); // 严格串行
-  // 一：受理回执→结果；二：受理回执(黄)→开始处理(蓝)→结果(绿)
-  await waitFor(() => messenger.updates.filter((u) => u.card.header.template === 'green').length === 2);
-  assert.equal(messenger.updates[1].card.header.template, 'blue');
-  assert.match(messenger.updates[2].card.body.elements[0].content, /二/);
+  // 一：回执(蓝)→结果(绿新卡)；二：回执(黄)→开始时刷「已开始」(蓝)→结果(绿新卡)
+  await waitFor(() => messenger.replies.filter((r) => r.card.header.template === 'green').length === 2);
+  assert.equal(messenger.updates.length, 1);
+  assert.equal(messenger.updates[0].card.header.template, 'blue'); // 「已排队」→「已开始」
+  assert.match(messenger.updates[0].card.header.title.content, /已开始/);
+  assert.match(messenger.replies[3].card.body.elements[0].content, /二/);
 });
 
 test('消息驱动：白名单外用户 / 非文本 / 应用消息 / 重复推送被忽略', async () => {
@@ -1050,7 +1139,7 @@ test('消息驱动：白名单外用户 / 非文本 / 应用消息 / 重复推�
   assert.equal(runs.length, 1);
 });
 
-test('消息驱动：runClaude 失败/超时 → 回执更新为失败/超时卡片', async () => {
+test('消息驱动：runClaude 失败/超时 → 另发失败/超时结果卡片（回执保持已开始）', async () => {
   const messenger = fakeMessenger();
   const runner = createChatRunner({ herdr: fakeHerdr(),
     cfg: CHAT_CFG,
@@ -1059,8 +1148,8 @@ test('消息驱动：runClaude 失败/超时 → 回执更新为失败/超时卡
     runClaude: async () => ({ ok: false, timedOut: true, error: '超过 60s 未完成，已终止' }),
   });
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '慢任务' }));
-  await waitFor(() => messenger.updates.length === 1);
-  const card = messenger.updates[0].card;
+  await waitFor(() => messenger.replies.length === 2);
+  const card = messenger.replies[1].card;
   assert.equal(card.header.template, 'yellow');
   assert.match(card.header.title.content, /超时/);
   assert.match(card.body.elements[0].content, /超过 60s/);
@@ -1072,9 +1161,9 @@ test('消息驱动：runClaude 失败/超时 → 回执更新为失败/超时卡
     runClaude: async () => ({ ok: false, error: 'claude 退出码 1' }),
   });
   await runner2.handleMessage(msgEvent({ chatType: 'group', text: '会失败', chatId: 'oc_chat2', messageId: 'om_2' }));
-  await waitFor(() => messenger.updates.length === 2);
-  assert.equal(messenger.updates[1].card.header.template, 'orange');
-  assert.match(messenger.updates[1].card.body.elements[0].content, /claude 退出码 1/);
+  await waitFor(() => messenger.replies.length === 4);
+  assert.equal(messenger.replies[3].card.header.template, 'orange');
+  assert.match(messenger.replies[3].card.body.elements[0].content, /claude 退出码 1/);
 });
 
 test('chatForCwd：绑定目录（含子目录）命中，最长前缀优先，目录边界精确', async () => {
@@ -1143,11 +1232,17 @@ test('卡片内容：回执/结果卡片与 extractText', () => {
 
   const ack = buildTaskAckCard({ prompt: 'p', name: 'Elio', queued: true });
   assert.equal(ack.header.template, 'yellow');
+  assert.match(ack.header.title.content, /^已排队 · p$/);
   assert.match(ack.body.elements[0].content, /回复 Elio：p/);
   assert.match(ack.body.elements[0].content, /排队/);
+  assert.doesNotMatch(ack.body.elements.at(-1).content, /完成后/); // 回执不再承诺「完成后更新」
   const ack2 = buildTaskAckCard({ prompt: 'p2' });
   assert.equal(ack2.header.template, 'blue');
-  assert.match(ack2.header.title.content, /收到，Claude Code 开始处理/);
+  assert.match(ack2.header.title.content, /^已开始 · p2$/);
+  // 超长指令标题单行截断（truncate 会附加换行提示，标题必须单行）
+  const ack3 = buildTaskAckCard({ prompt: `一${'很长的指令'.repeat(20)}` });
+  assert.ok(!ack3.header.title.content.includes('\n'));
+  assert.ok(ack3.header.title.content.endsWith('…'));
   const ok = buildTaskResultCard({
     ok: true, body: '答案', prompt: '查状态', sessionId: 'sess-abc12345', cwd: '/w',
     durationMs: 1500, costUsd: 0.005, numTurns: 2,
@@ -1271,18 +1366,21 @@ test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身�
     assert.equal(tA.messenger.userTexts.length, 0);
     assert.match(tA.messenger.sentTo[0].card.header.title.content, /CLI 输入/);
     await waitFor(() => tA.messenger.updates.length === 1); // bot 镜像卡随即 patch 成受理回执卡
-    assert.match(tA.messenger.updates[0].card.header.title.content, /收到，Claude Code 开始处理/);
-    // Stop 读不到 transcript（远程机器/未落盘）：不新发卡片，回执卡收尾为灰色「回合已结束」
+    assert.match(tA.messenger.updates[0].card.header.title.content, /^已开始 · 你好$/);
+    // Stop 读不到 transcript（远程机器/未落盘）：另发灰色「回合已结束」收尾卡串在镜像卡下，
+    // 回执卡保持「已开始」不动（updates 不再增加）
     await post(tA.base, '/hook/stop', {
       session_id: 'sess-mirror-a',
       cwd: DEFAULT_BINDING.cwd,
       transcript_path: path.join(dir, 'nope.jsonl'),
     });
-    await waitFor(() => tA.messenger.updates.length === 2);
-    assert.match(tA.messenger.updates[1].card.header.title.content, /回合已结束/);
-    assert.equal(tA.messenger.updates[1].card.header.template, 'grey');
-    assert.doesNotMatch(tA.messenger.updates[1].card.header.title.content, /已完成/);
-    assert.equal(tA.messenger.sentTo.length, 1, '读不到最终文本时不得新发任何卡片');
+    await waitFor(() => tA.messenger.replies.length === 1);
+    assert.equal(tA.messenger.replies[0].messageId, 'msg_1', '收尾卡串在 bot 镜像卡下');
+    assert.match(tA.messenger.replies[0].card.header.title.content, /回合已结束/);
+    assert.equal(tA.messenger.replies[0].card.header.template, 'grey');
+    assert.doesNotMatch(tA.messenger.replies[0].card.header.title.content, /已完成/);
+    assert.equal(tA.messenger.updates.length, 1, '回执卡不被改动');
+    assert.equal(tA.messenger.sentTo.length, 1, '读不到最终文本时不得独立另发卡片');
     await tA.close();
 
     // B) 凭据属白名单外用户 → 拒绝本人身份，降级 bot 卡
@@ -1295,7 +1393,7 @@ test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身�
     assert.equal(tB.messenger.userTexts.length, 0);
     await tB.close();
 
-    // C) 有效凭据（白名单内）→ 以本人身份发文本；受理回执卡串在其下，Stop 结果 patch 回执卡
+    // C) 有效凭据（白名单内）→ 以本人身份发文本；受理回执卡串在其下，Stop 结果另发新卡串在其下
     const fileC = path.join(dir, 'c.json');
     fs.writeFileSync(fileC, JSON.stringify({ access_token: 'u-at-c', access_expires_at: Date.now() + 3600_000, refresh_token: 'rt-c', open_id: 'ou_me' }));
     const tC = await startBridge({ authFile: fileC, allowedOpenIds: ['ou_me'], injectAckName: 'Elio' });
@@ -1307,9 +1405,10 @@ test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身�
     assert.equal(tC.messenger.sentTo.length, 0, '本人身份成功后不应再发 bot 卡');
     await waitFor(() => tC.messenger.replies.length === 1);
     assert.equal(tC.messenger.replies[0].messageId, 'umsg_1', '受理回执卡串在本人身份镜像消息下（fake 计数器从 1 起）');
-    assert.match(tC.messenger.replies[0].card.header.title.content, /收到，Claude Code 开始处理/);
+    assert.match(tC.messenger.replies[0].card.header.title.content, /^已开始 · 你好C$/);
     assert.match(tC.messenger.replies[0].card.body.elements[0].content, /回复 Elio：你好C/);
-    // Stop 读到本回合最终输出 → 受理回执卡 patch 成「已完成 · 你好C」
+    // Stop 读到本回合最终输出 → 另发新卡「已完成 · 你好C」串在本人身份镜像消息下，
+    // 回执卡保持「已开始」不改动
     const transcriptC = path.join(dir, 'c-transcript.jsonl');
     fs.writeFileSync(
       transcriptC,
@@ -1319,10 +1418,11 @@ test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身�
       ].join('\n') + '\n',
     );
     await post(tC.base, '/hook/stop', { session_id: 'sess-mirror-c', cwd: DEFAULT_BINDING.cwd, transcript_path: transcriptC });
-    await waitFor(() => tC.messenger.updates.length === 1);
-    assert.equal(tC.messenger.updates[0].messageId, 'msg_2', 'Stop 结果应 patch 受理回执卡');
-    assert.match(tC.messenger.updates[0].card.header.title.content, /已完成 · 你好C/);
-    assert.match(tC.messenger.updates[0].card.body.elements[0].content, /收到，这是最终回复/);
+    await waitFor(() => tC.messenger.replies.length === 2);
+    assert.equal(tC.messenger.replies[1].messageId, 'umsg_1', 'Stop 结果卡串在本人身份镜像消息下');
+    assert.match(tC.messenger.replies[1].card.header.title.content, /已完成 · 你好C/);
+    assert.match(tC.messenger.replies[1].card.body.elements[0].content, /收到，这是最终回复/);
+    assert.equal(tC.messenger.updates.length, 0, '回执卡不被改动');
   } finally {
     if (prevHerdr === undefined) delete process.env.HERDR_BIN;
     else process.env.HERDR_BIN = prevHerdr;
@@ -1366,13 +1466,13 @@ test('注入：默认注入最近活跃会话；#N 定向与排队提示；block
   assert.equal(herd.prompts[0].paneId, 'w1:p1');
   assert.equal(herd.prompts[0].text, '修复登录页');
   assert.equal(runs.length, 0);
-  assert.match(messenger.replies[0].card.header.title.content, /收到，Claude Code 开始处理/);
+  assert.match(messenger.replies[0].card.header.title.content, /^已开始 · 修复登录页$/);
   assert.match(messenger.replies[0].card.body.elements[0].content, /回复 Elio：修复登录页/);
   assert.ok(state.isInjectedPrompt('sid-aaa', '修复登录页'), '注入的 prompt 不应再被镜像');
   assert.ok(!state.isInjectedPrompt('sid-aaa', '修复登录页'), '注入额度已被 hook 上报消费，手输同内容应正常镜像');
   const m1 = state.takeMirror('sid-aaa');
   assert.equal(m1?.id, 'om_inj_1', '结果卡应串在用户消息下');
-  assert.equal(m1?.ackId, 'msg_1', 'Stop 结果应 patch 受理回执卡');
+  assert.equal(m1?.ackId, undefined, '不再记录回执卡 id（结果卡另发新卡，不 patch 回执）');
   assert.equal(m1?.label, '修复登录页', '结果卡标题用指令原文');
 
   // #2 定向 + working 排队提示（回执卡变体）
@@ -1398,8 +1498,9 @@ test('注入：默认注入最近活跃会话；#N 定向与排队提示；block
   // 目录下没有 herdr 会话（oc_chat2 → /repo/b）→ 回退无头执行（受理回执卡同款）
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '普通任务', chatId: 'oc_chat2', messageId: 'om_fb_1' }));
   await waitFor(() => runs.length === 1);
-  await waitFor(() => messenger.replies.length === 3);
-  assert.match(messenger.replies[2].card.header.title.content, /收到/);
+  await waitFor(() => messenger.replies.length === 4); // 回执 + 结果新卡（两者都是 reply）
+  assert.match(messenger.replies[2].card.header.title.content, /已开始/);
+  assert.match(messenger.replies[3].card.body.elements[0].content, /echo:普通任务/);
   assert.equal(herd.prompts.length, 3, '/sessions 不注入，blocked 已拒绝一条不新增');
 });
 

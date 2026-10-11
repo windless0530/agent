@@ -96,7 +96,7 @@ export function runClaudeOnce({ bin = 'claude', cwd, prompt, sessionId = '', mod
  *
  * 注入优先（chatInject，默认开）：绑定目录下有 herdr 管理的 claude 会话时，消息经
  * `herdr agent prompt` 回合级注入该会话（busy 自动排队、blocked 拒绝注入）——群与终端
- * 共享同一条会话线，受理回执卡串在用户消息下、Stop 时 patch 成统一结果卡。没有可用
+ * 共享同一条会话线，受理回执卡串在用户消息下、Stop 时另发结果新卡（回执保持不动）。没有可用
  * 会话才回退老行为：每群串行跑无头
  * `claude -p [--resume]`。`#序号 内容` 定向、`/attach 序号` 固定、`/sessions` 列表。
  * 防回环（state 共享给 hook 镜像侧）：镜像出去的本人消息 id 直接丢弃；注入的 prompt
@@ -230,10 +230,10 @@ export function createChatRunner({
       numTurns: r.numTurns,
     });
     try {
-      if (ackId) await messenger.updateCard(ackId, card);
-      else await messenger.replyCard(messageId, card);
+      // 结果另发新卡串在来源消息下（受理回执卡保持「已开始」不改动）
+      await messenger.replyCard(messageId, card);
     } catch (e) {
-      log('error', '更新结果卡片失败，改发文本:', e.message);
+      log('error', '发送结果卡片失败，改发文本:', e.message);
       try {
         await messenger.replyText(chatId, truncate(r.result || r.error || '(无输出)', 3000));
       } catch { /* 放弃 */ }
@@ -332,16 +332,15 @@ export function createChatRunner({
     }
 
     // 成功：登记防环（此 prompt 不再镜像，额度由 hook 上报消费）+ 受理回执卡 +
-    // 来源消息进镜像队列（Stop 结果卡 patch 回执卡，标题带指令原文）
+    // 来源消息进镜像队列（Stop 结果卡另发新卡串在来源下，标题带指令原文）
     st.markInjection(sid, body);
     const queued = target.agent_status === 'working';
-    let ackId = null;
     try {
-      ackId = await messenger.replyCard(msg.message_id, buildTaskAckCard({ prompt: body, name: cfg.injectAckName, queued }));
+      await messenger.replyCard(msg.message_id, buildTaskAckCard({ prompt: body, name: cfg.injectAckName, queued }));
     } catch (e) {
       log('error', '发送注入回执卡失败:', e.message);
     }
-    st.enqueueMirror(sid, msg.message_id, body, ackId);
+    st.enqueueMirror(sid, msg.message_id, body);
     log(
       'inject',
       `chat=${shortId(chatId)} pane=${target.pane_id} sid=${shortId(sid)}: ${truncate(body, 100)}`,
@@ -448,7 +447,8 @@ export function createChatRunner({
 
     log('chat', `指令 chat=${shortId(chatId)} from=${shortId(senderId)} cwd=${binding.cwd}: ${truncate(prompt, 120)}`);
     const position = queues.get(chatId)?.waiting || 0;
-    // 受理即回执（不等排队），跑完把同一张卡片 patch 成结果
+    // 受理即回执（不等排队，排队为黄色变体；ackId 仅用于排队开始时刷新为「已开始」）。
+    // 跑完另发结果卡串在来源消息下，回执卡保持「已开始」不改动
     let ackId = null;
     try {
       ackId = await messenger.replyCard(msg.message_id, buildTaskAckCard({ prompt, queued: position > 0 }));

@@ -31,7 +31,7 @@ export const DEFAULTS = {
   /** 飞书消息驱动 Claude Code 开关（按 bindings 绑定的群触发） */
   chatEnabled: true,
   /** 受理回执卡的引用行称呼（如 "Elio"）：非空时回执卡引用行为「回复 Elio：<prompt>」，
-   *  卡片标题固定「收到，Claude Code 开始处理」。注入 / 终端镜像 / 无头三条路径共用 */
+   *  回执标题「已开始 · 指令」（排队时「已排队」）。注入 / 终端镜像 / 无头三条路径共用 */
   injectAckName: '',
   /** 消息注入模式（默认开）：绑定目录下有 herdr 管理的 claude 会话时，群消息经
    *  `herdr agent prompt` 注入该会话（群与终端共享同一条会话线），而非另起无头进程；

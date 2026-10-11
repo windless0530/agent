@@ -15,7 +15,8 @@ import {
   buildTaskAckCard,
   buildTaskResultCard,
 } from './cards.mjs';
-import { findAgentBySession } from './herdr.mjs';
+import { findAgentBySession, readPane } from './herdr.mjs';
+import { parseDialogOptions, dialogHasAutoRow } from './dialog.mjs';
 import { getUserAccessToken } from './auth.mjs';
 import { createBridgeState } from './state.mjs';
 
@@ -99,7 +100,7 @@ function readBody(req, limit = 1024 * 1024) {
  * cc-bridge daemon 核心：HTTP 服务 + 挂起请求队列 + 免确认规则。
  * messenger 只需实现 sendCard(card)->messageId 与 updateCard(messageId, card)。
  */
-export function createBridge({ cfg, messenger, chat = null, bridgeState = null }) {
+export function createBridge({ cfg, messenger, chat = null, bridgeState = null, paneReader = null }) {
   const pending = new Map(); // rid -> { res, messageId, meta, timer, settled }
   const recentResolved = new Map(); // session_id -> resolve 时间戳（抑制迟到的 permission_prompt 通知）
   const recentStop = new Map(); // session_id -> Stop 输出卡时间戳（抑制其后的 idle_prompt 空闲提醒）
@@ -286,6 +287,25 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
 
   // ---------- hook 事件处理 ----------
 
+  /** 读终端确认框文本：session → herdr pane → agent read（读屏拿 ground truth，
+   *  见 src/dialog.mjs）。hook 触发与对话框渲染有毫秒级竞态，读不到编号选项时
+   *  隔 300/800ms 重试；pane 不存在（非 herdr 会话 / 远程机器）直接空。 */
+  async function readDialogText(sessionId) {
+    try {
+      const agent = await findAgentBySession(sessionId);
+      const pane = agent?.pane_id;
+      if (!pane) return '';
+      for (const delay of [0, 300, 800]) {
+        if (delay) await new Promise((r) => setTimeout(r, delay));
+        const text = await readPane(pane);
+        if (parseDialogOptions(text).length) return text;
+      }
+    } catch {
+      // 读屏失败（herdr 不可用等）按读不到处理
+    }
+    return '';
+  }
+
   async function handleConfirmation(req, res, payload, event = 'pretooluse') {
     const tool = payload.tool_name || 'Unknown';
     const input = payload.tool_input || {};
@@ -304,8 +324,18 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
     // 只保留结构合法的条目，与卡片/回传共用同一数组
     const suggestions = (Array.isArray(payload.permission_suggestions) ? payload.permission_suggestions : [])
       .filter((s) => s && typeof s === 'object' && typeof s.type === 'string');
-    // 与终端确认框一致的选项（Yes / 合并建议行 / 可选 auto 行 / No）；按钮与点击处理共用
-    const options = confirmOptions({ suggestions, cwd: payload.cwd, permissionMode: payload.permission_mode });
+    // 与终端确认框一致的选项（Yes / 合并建议行 / 读屏决定的 auto 行 / No）；按钮与点击处理共用
+    let autoRow = false;
+    if (suggestions.length) {
+      const text = await (paneReader ? paneReader(payload.session_id) : readDialogText(payload.session_id));
+      const dialogOpts = parseDialogOptions(text);
+      autoRow = dialogHasAutoRow(dialogOpts);
+      log(
+        'dialog',
+        `终端确认框 ${dialogOpts.length} 个选项${autoRow ? '（含 auto 行）' : dialogOpts.length ? '（无 auto 行）' : '（未读到，auto 行按无处理）'}`,
+      );
+    }
+    const options = confirmOptions({ suggestions, cwd: payload.cwd, autoRow });
     const rid = crypto.randomUUID();
     let messageId;
     try {
@@ -319,7 +349,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
           session: payload.session_id,
           timeoutSec: cfg.timeoutSec,
           suggestions,
-          permissionMode: payload.permission_mode,
+          autoRow,
         }),
       );
     } catch (e) {
@@ -366,43 +396,24 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
       if (payload.__fromChat === 1) {
         return sendJson(res, 200, '');
       }
-      // 「任务完成」卡（notifyStop: false 关闭，默认开）：只在读得到 transcript 且能取到
-      // 本回合最终 assistant 文本时才发——「🏁 已完成」必须带着真实最终输出，读不到
-      // （远程机器路径 / 末行未落盘）时不新发任何卡，避免任务还在中途就冒出空泛的
-      // 「已完成，等待输入」。已存在的受理回执卡不能永远停在「开始处理」：读不到输出
-      // 时把它 patch 成灰色「回合已结束」终态（不新增卡片、不误称已完成）。
-      // 有输出时与注入/镜像/无头共用 buildTaskResultCard（标题带指令原文）：有受理回执卡
-      // 直接 patch 它（ack→result 一体）；无回执卡但有来源消息 → 串在其下；
-      // 都没有 → 独立发。排队连发多条 prompt 时按提交顺序逐条配对（取最旧）
+      // 「任务完成」结果卡（notifyStop: false 关闭，默认开）：完成时**另发一张新卡**，
+      // 受理回执卡保持「已开始 · 指令」不改动。结果卡优先串在来源消息下（终端镜像/
+      // 群注入的来源），没有来源则独立发。只在读得到 transcript 且能取到本回合最终
+      // assistant 文本时才发「🏁 已完成」——必须带真实最终输出；读不到输出但有来源
+      // 消息时发灰色「◌ 回合已结束」收尾（不冒充已完成）；两者都没有（无镜像的会话
+      // 又读不到 transcript）不发任何卡，避免任务还在中途就冒出空泛的完成提示。
+      // 排队连发多条 prompt 时按提交顺序逐条配对（取最旧）
       if (cfg.notifyStop !== false) {
         const output = await finalTurnTextWithRetry(payload.transcript_path);
         const mirror = st.takeMirror(payload.session_id);
-        if (!output) {
+        if (!output && !mirror) {
           log('notify', `Stop 未读到本回合最终文本（会话 ${shortId(payload.session_id || '')}），跳过结果卡`);
-          if (mirror?.ackId) {
-            try {
-              await messenger.updateCard(
-                mirror.ackId,
-                buildTaskResultCard({
-                  ok: true,
-                  muted: true,
-                  body: '',
-                  prompt: mirror.label || '',
-                  sessionId: payload.session_id,
-                  cwd: payload.cwd,
-                }),
-              );
-              if (payload.session_id) recentStop.set(payload.session_id, Date.now());
-              log('card', `Stop 回执卡置为「回合已结束」 message_id=${mirror.ackId}`);
-            } catch (e) {
-              log('error', '更新回执卡失败:', e.message);
-            }
-          }
           return sendJson(res, 200, '');
         }
         const card = buildTaskResultCard({
           ok: true,
-          body: output,
+          muted: !output,
+          body: output || '',
           prompt: mirror?.label || '',
           sessionId: payload.session_id,
           cwd: payload.cwd,
@@ -410,27 +421,18 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
         try {
           let messageId = null;
           let via = '';
-          if (mirror?.ackId) {
-            try {
-              await messenger.updateCard(mirror.ackId, card);
-              messageId = mirror.ackId;
-              via = '（回执卡更新）';
-            } catch (e) {
-              log('error', `更新回执卡失败（${shortId(mirror.ackId)}），改串来源消息:`, e.message);
-            }
-          }
-          if (!messageId && mirror?.id) {
+          if (mirror?.id) {
             try {
               messageId = await messenger.replyCard(mirror.id, card);
-              via = '（镜像回复）';
+              via = '（串在来源消息下）';
             } catch (e) {
-              log('error', `回复镜像失败（${shortId(mirror.id)}），改发独立卡片:`, e.message);
+              log('error', `回复来源消息失败（${shortId(mirror.id)}），改发独立卡片:`, e.message);
             }
           }
           if (!messageId) messageId = await sendCardRouted(payload.cwd, card);
           if (messageId) {
             if (payload.session_id) recentStop.set(payload.session_id, Date.now());
-            log('card', `Stop 结果卡 message_id=${messageId}${via}`);
+            log('card', `Stop 结果卡${!output ? '（回合已结束，未读到输出）' : ''} message_id=${messageId}${via}`);
           } else {
             log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，跳过 Stop 结果卡`);
           }
@@ -512,7 +514,8 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
       const agent = await findAgentBySession(sid);
       const label = agent?.terminal_title_stripped || (sid ? shortId(sid) : '');
 
-      // 受理回执卡：与注入/无头路径同一张（引用指令原文），Stop 时 patch 成结果卡
+      // 受理回执卡：与注入/无头路径同一张（引用指令原文）；完成后不改动它，
+      // Stop 结果卡另发、串在来源消息下
       const ackOf = async (sourceId) => {
         try {
           return await messenger.replyCard(sourceId, buildTaskAckCard({ prompt, name: cfg.injectAckName }));
@@ -534,8 +537,8 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
               if (messageId) {
                 // 防环第 1 层：本人身份消息会真实触发 receive 事件，登记 id 供入站丢弃
                 st.markMirroredMsg(messageId);
-                const ackId = await ackOf(messageId);
-                st.enqueueMirror(sid, messageId, prompt, ackId);
+                await ackOf(messageId);
+                st.enqueueMirror(sid, messageId, prompt);
                 log('card', `镜像消息(本人) message_id=${messageId}${label ? `（${truncate(label, 30)}）` : ''}`);
                 return;
               }
@@ -549,14 +552,12 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
 
       // 2) 降级：bot 镜像卡发出后直接 patch 成受理回执卡（同一张卡承担「镜像 + 受理」）
       const messageId = await messenger.sendCardTo(target, buildPromptMirrorCard({ prompt, title: label, sid, cwd: payload.cwd }));
-      let ackId = null;
       try {
         await messenger.updateCard(messageId, buildTaskAckCard({ prompt, name: cfg.injectAckName }));
-        ackId = messageId;
       } catch (e) {
         log('error', '镜像卡 patch 回执失败（Stop 将串在该卡下）:', e.message);
       }
-      st.enqueueMirror(sid, messageId, prompt, ackId);
+      st.enqueueMirror(sid, messageId, prompt);
       log('card', `镜像卡 message_id=${messageId}${label ? `（${truncate(label, 30)}）` : ''}`);
     } catch (e) {
       log('error', '发送 prompt 镜像失败:', e.message);

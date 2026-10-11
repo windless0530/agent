@@ -91,8 +91,8 @@ const MODE_DESCRIPTIONS = {
   bypassPermissions: 'BYPASS PERMISSIONS (no further prompts)',
 };
 
-/** auto 模式选项（cli.js hpr.workflow + C6e），UI 自加、不出现在 suggestions 里；
- *  点击等价于回传 kge('auto') 的 applies：setMode{auto, session} */
+/** auto 模式选项（cli.js UI 自加、不出现在 suggestions 里）；是否渲染由终端确认框
+ *  实际显示决定（读屏，见 src/dialog.mjs），不再按 permission_mode 猜 */
 const AUTO_MODE_LABEL = 'Yes, and switch to auto mode';
 const AUTO_MODE_DESC = '· auto mode handles these prompts for you';
 export const AUTO_MODE_UPDATE = { type: 'setMode', mode: 'auto', destination: 'session' };
@@ -127,15 +127,15 @@ export function suggestionsRowLabel(suggestions, cwd) {
     const suffix = suggestions.some((s) => s.destination === 'userSettings')
       ? ' in any project (user settings)'
       : '';
-    return `Yes, and don't ask again for ${domainRules.map((r) => r.ruleContent.slice('domain:'.length)).join(' and ')}${suffix}`;
+    return `Yes, and don’t ask again for ${domainRules.map((r) => r.ruleContent.slice('domain:'.length)).join(' and ')}${suffix}`;
   }
   const bashRules = rules.filter((r) => r?.toolName === 'Bash');
   if (bashRules.length === rules.length && rules.length) {
-    // Bash 简单场景：可编辑前缀行「Yes, and don't ask again for: <prefix>」
-    return `Yes, and don't ask again for: ${bashRules.map((r) => r.ruleContent).join(', ')}`;
+    // Bash 简单场景：可编辑前缀行「Yes, and don’t ask again for: <prefix>」
+    return `Yes, and don’t ask again for: ${bashRules.map((r) => r.ruleContent).join(', ')}`;
   }
   // 通用行（MCP 等）：规则显示用 Pn 格式、以 " and " 连接
-  return `Yes, and don't ask again for ${clip(rules.map(ruleDisplay).join(' and '))}`;
+  return `Yes, and don’t ask again for ${clip(rules.map(ruleDisplay).join(' and '))}`;
 }
 
 /** 按钮文本字符预算：飞书按钮无对齐属性、按渲染像素折行（居中），折行会把首行顶偏。
@@ -173,21 +173,23 @@ function suggestionsRowParts(suggestions) {
       ? ' in any project (user settings)'
       : '';
     return {
-      detail: `don't ask again for ${domainRules.map((r) => r.ruleContent.slice('domain:'.length)).join(' and ')}${suffix}`,
+      detail: `don’t ask again for ${domainRules.map((r) => r.ruleContent.slice('domain:'.length)).join(' and ')}${suffix}`,
     };
   }
   const bashRules = rules.filter((r) => r?.toolName === 'Bash');
   if (bashRules.length === rules.length && rules.length) {
-    return { detail: `don't ask again for: \`${clip(bashRules.map((r) => r.ruleContent).join(', '), 300)}\`` };
+    return { detail: `don’t ask again for: \`${clip(bashRules.map((r) => r.ruleContent).join(', '), 300)}\`` };
   }
-  return { detail: `don't ask again for ${clip(rules.map(ruleDisplay).join(' and '), 300)}` };
+  return { detail: `don’t ask again for ${clip(rules.map(ruleDisplay).join(' and '), 300)}` };
 }
 
 /**
- * 组装与终端确认框一致的选项列表（含顺序与编号素材）。
- * auto 模式选项的提供条件对齐 cli.js wTt：当前 permission_mode 为 default/acceptEdits 才显示。
+ * 组装与终端确认框一致的选项列表（含顺序与编号素材）：Yes / 合并建议行 / No，
+ * autoRow=true（终端确认框实际渲染了该行，读屏所得）时在建议行后插入 auto 模式行。
+ * 不按 permission_mode 猜：该行可见性是 CLI 运行时状态（账号 gate 快照 / 模式 /
+ * 熔断器），hook payload 里没有，猜必错——见 src/dialog.mjs。
  */
-export function confirmOptions({ suggestions = [], cwd, permissionMode } = {}) {
+export function confirmOptions({ suggestions = [], cwd, autoRow = false } = {}) {
   const opts = [{ label: 'Yes', type: 'primary', act: 'allow' }];
   if (suggestions.length) {
     opts.push({
@@ -198,8 +200,7 @@ export function confirmOptions({ suggestions = [], cwd, permissionMode } = {}) {
       updates: suggestions, // yes-apply-suggestions：全部条目原样回传
     });
   }
-  const modeOk = [undefined, 'default', 'manual', 'acceptEdits'].includes(permissionMode);
-  if (suggestions.length && modeOk) {
+  if (autoRow && suggestions.length) {
     opts.push({
       label: `${AUTO_MODE_LABEL} ${AUTO_MODE_DESC}`,
       detail: AUTO_MODE_DESC.replace(/^·\s*/, ''),
@@ -220,11 +221,11 @@ function note(text) {
 /**
  * 待确认交互卡片（schema 2.0）。
  * 带 permission_suggestions 时：选项列表与终端确认框一致（Yes / 合并建议行 /
- * 可选 auto 模式行 / No，带 1. 2. 3. 编号，文案对照 cli.js 渲染模板）。按钮放完整
- * 文案、按单行预算词边界截断（见 BTN_TEXT_MAX）；放不下的详情左对齐补在正文里。
- * 无 suggestions（旧 CLI / 不读该数组的确认框，如文件编辑）时回退固定三键。
+ * 读屏决定的可选 auto 模式行 / No，带 1. 2. 3. 编号，文案对照 cli.js 渲染模板）。
+ * 按钮放完整文案、按单行预算词边界截断（见 BTN_TEXT_MAX）；放不下的详情左对齐
+ * 补在正文里。无 suggestions（旧 CLI / 不读该数组的确认框，如文件编辑）时回退固定三键。
  */
-export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec, suggestions = [], permissionMode }) {
+export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec, suggestions = [], autoRow = false }) {
   const lines = [
     `**工具**：\`${tool}\`　${summary.headline}`,
     summary.detail,
@@ -235,7 +236,7 @@ export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec,
   let buttons;
   if (suggestions.length) {
     lines.push('**Do you want to proceed?**');
-    const opts = confirmOptions({ suggestions, cwd, permissionMode });
+    const opts = confirmOptions({ suggestions, cwd, autoRow });
     const labelOf = (o, i) => `${i + 1}. ${o.label}`;
     // 完整文案放不进按钮单行预算的选项：详情左对齐补在正文里，编号与按钮对应
     opts.forEach((o, i) => {
@@ -359,7 +360,6 @@ export function buildNotifyCard({ title, message, cwd, severity = 'info' }) {
 
 // ---------- 飞书消息驱动 Claude Code ----------
 
-/** 指令受理回执：先回这张，claude 跑完后 patch 成结果卡片 */
 /** CLI 输入镜像卡：把用户在终端提交的 prompt 镜像到绑定群（UserPromptSubmit hook）。
  *  title 取 herdr 的会话主题（terminal_title_stripped），herdr 不可用时退化为 sid。 */
 export function buildPromptMirrorCard({ prompt, title = '', sid = '', cwd = '' }) {
@@ -388,8 +388,13 @@ export function buildPromptMirrorCard({ prompt, title = '', sid = '', cwd = '' }
   };
 }
 
-/** 任务受理回执卡：飞书注入 / 终端镜像 / 无头执行统一用这张（引用指令原文），
- *  完成后 patch 成 buildTaskResultCard。name（injectAckName）非空时引用行带「回复 {name}：」 */
+/** 卡片标题里的指令原文：单行截断（truncate 会附加换行提示，标题必须单行） */
+const headOf = (prompt, n = 30) => (prompt ? ` · ${clip(prompt, n)}` : '');
+
+/** 任务受理回执卡：飞书注入 / 终端镜像 / 无头执行统一用这张（引用指令原文）。
+ *  标题带指令原文（超卡片宽度单行截断加 …）；完成后**不改动本卡**——结果另发
+ *  一张新卡（串在来源消息下），本卡永久停留在「已开始」受理时刻。
+ *  name（injectAckName）非空时引用行带「回复 {name}：」 */
 export function buildTaskAckCard({ prompt, name = '', queued = false }) {
   const quote = `${name ? `回复 ${name}：` : ''}${truncate(prompt, 400)}`;
   const lines = [`<font color='grey'>💬 ${quote}</font>`];
@@ -398,24 +403,24 @@ export function buildTaskAckCard({ prompt, name = '', queued = false }) {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: queued ? '收到，已排队等待执行' : '收到，Claude Code 开始处理' },
+      title: { tag: 'plain_text', content: queued ? `已排队${headOf(prompt)}` : `已开始${headOf(prompt)}` },
       template: queued ? 'yellow' : 'blue',
     },
     body: {
       elements: [
         { tag: 'markdown', content: lines.join('\n') },
-        note(`${now()} · 完成后本卡片更新为回复 · ${hostname()}`),
+        note(`${now()} · ${hostname()}`),
       ],
     },
   };
 }
 
-/** 任务结果卡：完成时把回执卡 patch 成这张（无回执卡的 Stop 输出也用它）。
- *  标题带指令原文（prompt），正文为最终输出；失败/超时为橙/黄变体；muted 为灰色的
- *  「回合已结束」——Stop 读不到本回合最终文本时收尾用（回执卡不能永远停在「开始处理」，
- *  但也不冒充「已完成」）。三条路径（注入 / 镜像 / 无头）共用，保证完成提示长得一样 */
+/** 任务结果卡：完成时**另发的新卡**（受理回执卡保持「已开始」不改动），串在来源
+ *  消息下；无来源消息的 Stop 输出独立发。标题带指令原文（prompt），正文为最终输出；
+ *  失败/超时为橙/黄变体；muted 为灰色「回合已结束」——Stop 读不到本回合最终文本时的
+ *  收尾（给回合一个结束信号，但不冒充「已完成」）。三条路径（注入/镜像/无头）共用 */
 export function buildTaskResultCard({ ok = true, timedOut = false, muted = false, body = '', prompt = '', sessionId = '', cwd = '', durationMs, costUsd, numTurns } = {}) {
-  const head = prompt ? ` · ${truncate(prompt, 30)}` : '';
+  const head = headOf(prompt);
   const meta = timedOut
     ? { title: `⏰ 超时${head}`, template: 'yellow' }
     : muted

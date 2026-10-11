@@ -18,16 +18,16 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
 
 1. `node cli.mjs install-hooks` 往 Claude Code 的 `settings.json` 写入两类 hook：
    - 确认类 hook：**`PermissionRequest`**（新版 CLI，自动探测；恰好在 Claude Code 要弹权限确认框时触发，已被允许的操作不会重复打扰）或 **`PreToolUse`**（旧版 CLI 回退，每次工具调用都触发）。hook 进程把工具调用详情 POST 给 daemon 并**阻塞等待**；daemon 发一张带选项按钮的卡片到飞书，你点击后决策以 hook JSON 返回，Claude Code 据此放行或拒绝（拒绝原因会告知 Claude，它会调整方案）。
-   - `Notification`（可选）：Claude 空闲等待输入等通知，转发为纯通知卡片。其中 `permission_prompt` 类通知（确认框闲置 ~6s 才触发）**在该会话已有挂起确认卡或刚被点击解决的 60s 内自动抑制**，避免与交互确认卡重复打扰；仅当 cc-bridge 未接管审批（发卡失败/并发超限回退本地确认）时才转发，作为手机端唯一提醒。`idle_prompt`（"Claude is waiting for your input"）**在该会话发过回合结果卡/回执卡终态的 10 分钟内同样抑制**（卡片已带最终回复或回合结束状态）。
+   - `Notification`（可选）：Claude 空闲等待输入等通知，转发为纯通知卡片。其中 `permission_prompt` 类通知（确认框闲置 ~6s 才触发）**在该会话已有挂起确认卡或刚被点击解决的 60s 内自动抑制**，避免与交互确认卡重复打扰；仅当 cc-bridge 未接管审批（发卡失败/并发超限回退本地确认）时才转发，作为手机端唯一提醒。`idle_prompt`（"Claude is waiting for your input"）**在该会话发过回合结果卡/「回合已结束」收尾卡的 10 分钟内同样抑制**（卡片已带最终回复或回合结束状态）。
 2. 超时（默认 300s）未响应 → 返回空决策，交互式会话回退为本地正常确认流程（**fail-open**，bridge 挂掉也不影响 Claude Code 使用）。注意：headless 等无法弹框的会话中，Claude Code 对「无决策」本身会拒绝该工具调用——手机审批就是这类会话唯一的人工通道。
-3. **终端本地作答联动**：Claude Code 不会因为你在终端本地回答了确认框而通知任何 hook（hook 进程与飞书卡片都会继续挂着），daemon 靠 `install-hooks` 一并安装的 `PostToolUse` / `Stop` 两个事件感知本地作答：同会话同工具同参数的工具确实执行了（PostToolUse，键序无关严格匹配，防并行同工具任务误伤）→ 卡片刷成「🖥️ 已在终端允许」；回合结束（Stop）→ 该会话剩余挂起卡片一律刷成「🖥️ 已在终端处理」（本地拒绝 / Esc 取消的兜底）。结算同时向仍挂起的 hook 连接回空体释放进程，卡片按钮随之失效。`Stop` 还会推「🏁 已完成 · 指令原文」结果卡，**内容即该回合的最终输出**（读 `transcript_path` 里本回合最后一条 assistant 文本，回溯到本回合发起消息为止——飞书群里的最后一张卡不再是 "waiting for your input" 空话）。**只在读得到 transcript 且取得到本回合最终文本时才发**：读不到（远程机器路径 / 末行尚未落盘，隔 300ms 重读一次仍失败）时不新发任何卡，已挂出的受理回执卡则收尾为灰色「◌ 回合已结束」（不冒新卡、不误称已完成）；`notifyStop: false` 全关。消息驱动会话的 Stop 不推（回复卡片已带结果）。
-4. **选项与终端确认框一一对应**：Claude Code 在 `permission_suggestions` 里给出确认框的选项建议，卡片按 cli.js 同款模板渲染为编号按钮（`1. Yes` / `2. Yes, and don't ask again for: <命令>` / …，个数与文案与终端一致）。飞书按钮无对齐属性、按渲染像素折行且居中（折行会把首行「Yes」顶偏），文本硬上限 100 字符，因此按钮文案按单行预算（Mac 端估 ~72-78 字符，取 70）**词边界截断加 `…`**；放不下的完整详情左对齐补在按钮上方的正文里，编号与按钮对应。点建议行 = 全部建议原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**；点 auto 行 = 回传 `setMode{auto, session}` 切换会话权限模式。终端上「switch to auto mode」选项本身不带建议条目（UI 自加），卡片据 `permission_mode`（default/acceptEdits 时提供）复原该选项。
+3. **终端本地作答联动**：Claude Code 不会因为你在终端本地回答了确认框而通知任何 hook（hook 进程与飞书卡片都会继续挂着），daemon 靠 `install-hooks` 一并安装的 `PostToolUse` / `Stop` 两个事件感知本地作答：同会话同工具同参数的工具确实执行了（PostToolUse，键序无关严格匹配，防并行同工具任务误伤）→ 卡片刷成「🖥️ 已在终端允许」；回合结束（Stop）→ 该会话剩余挂起卡片一律刷成「🖥️ 已在终端处理」（本地拒绝 / Esc 取消的兜底）。结算同时向仍挂起的 hook 连接回空体释放进程，卡片按钮随之失效。`Stop` 还会**另发**「🏁 已完成 · 指令原文」结果卡（受理回执卡保持「已开始」不动），**内容即该回合的最终输出**（读 `transcript_path` 里本回合最后一条 assistant 文本，回溯到本回合发起消息为止——飞书群里的最后一张卡不再是 "waiting for your input" 空话），优先串在该回合的来源消息下（终端镜像 / 群注入），没有来源则独立发。**只在读得到 transcript 且取得到本回合最终文本时才发**：读不到（远程机器路径 / 末行尚未落盘，隔 300ms 重读一次仍失败）时，有来源消息则发灰色「◌ 回合已结束」收尾卡（不冒充已完成），无来源不发任何卡；`notifyStop: false` 全关。消息驱动会话的 Stop 不推（回复卡片已带结果）。
+4. **选项与终端确认框一一对应**：Claude Code 在 `permission_suggestions` 里给出确认框的选项建议，卡片按 cli.js 同款模板渲染为编号按钮（`1. Yes` / `2. Yes, and don't ask again for: <命令>` / …，个数与文案与终端一致）。飞书按钮无对齐属性、按渲染像素折行且居中（折行会把首行「Yes」顶偏），文本硬上限 100 字符，因此按钮文案按单行预算（Mac 端估 ~72-78 字符，取 70）**词边界截断加 `…`**；放不下的完整详情左对齐补在按钮上方的正文里，编号与按钮对应。点建议行 = 全部建议原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**；点 auto 行 = 回传 `setMode{auto, session}` 切换会话权限模式。终端上「switch to auto mode」选项是否出现由 CLI 运行时状态决定（账号级 gate 快照、当前模式——manual 模式不提供、熔断器），hook payload 里没有这些状态——cc-bridge 不猜：**hook 阻塞期间确认框正渲染在终端上，daemon 经 herdr 读 pane 文本取 ground truth**（`herdr agent read --source visible`，解析见 `src/dialog.mjs`），终端有这行卡片才出。会话不在 herdr pane 里（远程机器 / 普通终端）读不到时按「无」处理。
    无 `permission_suggestions` 的确认框（如文件编辑类，不读该数组）或旧 CLI 回退为固定三键「✅ 允许 / 👍 总是允许（cc-bridge 内部规则，Bash 按首命令、文件工具按目录，daemon 重启清空）/ ❌ 拒绝」。
 5. **消息驱动 Claude Code**（`chatEnabled`，默认开）：在配置文件 `bindings` 里声明「群 ↔ 目录」绑定后，**绑定群里的文本消息免 @ 自动执行**，等价于在绑定目录的终端 `claude` cli 里输入（单聊不驱动执行）。按目录下是否已有运行中的会话分两种方式：
-   - **注入优先**（`chatInject`，默认开）：目录下有 herdr 管理的 claude 会话时，消息经 `herdr agent prompt` **回合级注入该会话**——群与终端共享同一条会话线（就是你终端里正在看的那个），会话 busy 自动排队、blocked（卡在确认框）拒绝注入并提示。**受理回执卡**「收到，Claude Code 开始处理」（引用行带 `injectAckName` 称呼与指令原文）串在你的消息下，完成后同一张卡 patch 成**统一结果卡**「🏁 已完成 · 指令原文」（正文为该回合最终输出；Stop 读不到最终文本时收尾为灰色「◌ 回合已结束」）。多会话寻址：`/sessions` 列出目录下会话（状态 ◐ 执行中 / ⛔ 等确认 / ○ 空闲）、`#3 内容` 定向注入 3 号、`/attach 3` 固定默认目标、`/detach` 解除固定（默认注入最近活跃的）。
-   - **无头回退**：目录下没有 herdr 会话才另起 `claude -p --output-format json [--resume <sid>]` 无头执行（每个群保留各自上下文），受理回执卡同款（排队时黄色变体），跑完 patch 成同一张统一结果卡（附耗时/轮数/费用），同群串行排队。
+   - **注入优先**（`chatInject`，默认开）：目录下有 herdr 管理的 claude 会话时，消息经 `herdr agent prompt` **回合级注入该会话**——群与终端共享同一条会话线（就是你终端里正在看的那个），会话 busy 自动排队、blocked（卡在确认框）拒绝注入并提示。**受理回执卡**「已开始 · 指令原文」（引用行带 `injectAckName` 称呼与指令原文）串在你的消息下，完成后**另发一张**统一结果卡「🏁 已完成 · 指令原文」串在同一来源下（正文为该回合最终输出；回执卡保持「已开始」；Stop 读不到最终文本时发灰色「◌ 回合已结束」收尾卡）。多会话寻址：`/sessions` 列出目录下会话（状态 ◐ 执行中 / ⛔ 等确认 / ○ 空闲）、`#3 内容` 定向注入 3 号、`/attach 3` 固定默认目标、`/detach` 解除固定（默认注入最近活跃的）。
+   - **无头回退**：目录下没有 herdr 会话才另起 `claude -p --output-format json [--resume <sid>]` 无头执行（每个群保留各自上下文），受理回执卡同款（排队时黄色变体），跑完**另发**同一款统一结果卡（附耗时/轮数/费用，串在你的消息下），同群串行排队。
    执行过程中的权限确认走上面的交互卡片，并按 `cwd` 路由回**该群**。发「**新会话**」（或 `/new`）丢弃无头会话线与注入目标固定（注入模式不新开会话，重启请在终端操作）；未绑定的群 @机器人 会回复配置提示。这些消息驱动的会话不再收「任务完成」重复通知。
-6. **终端输入镜像**（`mirrorPrompt`，默认开）：`UserPromptSubmit` hook 把你在终端提交的 prompt 镜像到绑定目录对应的群，并优先**以用户本人身份发文本消息**（`user_access_token`，群里显示为你自己发的，见下方 OAuth 授权），紧随其后同样回一张受理回执卡；无凭据/刷新失败/发送失败自动降级为 bot 卡（发出后直接 patch 成同款受理回执卡，标题带 herdr 会话主题或 session_id 前 8 位）。该会话回合结束时受理卡 patch 成统一结果卡「🏁 已完成 · 指令原文」（排队连发多条 prompt 时按提交顺序逐条配对；Stop 读不到本回合最终文本时收尾为灰色「◌ 回合已结束」，不冒新卡）。仅同步展示、不影响本地执行；镜像 hook 立即放行（10s 兜底），daemon 不可达也不拖住终端；消息驱动的会话不镜像（输入本就来自群里）。
+6. **终端输入镜像**（`mirrorPrompt`，默认开）：`UserPromptSubmit` hook 把你在终端提交的 prompt 镜像到绑定目录对应的群，并优先**以用户本人身份发文本消息**（`user_access_token`，群里显示为你自己发的，见下方 OAuth 授权），紧随其后同样回一张受理回执卡；无凭据/刷新失败/发送失败自动降级为 bot 卡（发出后直接 patch 成同款受理回执卡，标题带 herdr 会话主题或 session_id 前 8 位）。该会话回合结束时**另发**统一结果卡「🏁 已完成 · 指令原文」串在来源消息下（回执卡保持「已开始」；排队连发多条 prompt 时按提交顺序逐条配对；Stop 读不到本回合最终文本时收尾为灰色「◌ 回合已结束」收尾卡）。仅同步展示、不影响本地执行；镜像 hook 立即放行（10s 兜底），daemon 不可达也不拖住终端；消息驱动的会话不镜像（输入本就来自群里）。
 
 ### 镜像为「用户本人」消息（OAuth 授权）
 
@@ -115,7 +115,7 @@ daemon 机器把配置 `host` 改为 `0.0.0.0`（并设置 `token`）后 `./serv
 | `token` | 空 | hook 客户端与 daemon 之间的 Bearer 共享密钥（跨机器必设） |
 | `allowedOpenIds` | `[]` | 允许点按钮/发指令的飞书用户，空为不限制（**开启消息驱动建议配置**，否则绑定群里的任何人都能在你机器上跑 claude） |
 | `allow` | `[]` | 预置免确认规则，如 `["Bash:git", "Edit:/src", "WebFetch"]` |
-| `notifyStop` | `true` | Stop 事件推「🏁 已完成」卡，内容为该回合最终输出（读 transcript 本回合最后一条 assistant 文本）；**读不到本回合最终文本时不发卡**（已有受理回执卡则收尾为灰色「◌ 回合已结束」）；发卡后 10 分钟内抑制该会话的 idle_prompt 空闲提醒 |
+| `notifyStop` | `true` | Stop 事件**另发**「🏁 已完成」新卡（受理回执卡保持「已开始」），内容为该回合最终输出（读 transcript 本回合最后一条 assistant 文本）；**读不到本回合最终文本时**：有来源消息（镜像/注入）发灰色「◌ 回合已结束」收尾卡，否则不发卡；发卡后 10 分钟内抑制该会话的 idle_prompt 空闲提醒 |
 | `mirrorPrompt` | `true` | 把终端提交的 prompt 镜像到绑定群（详见工作原理第 6 条），不影响本地执行 |
 | `mirrorAsUser` | `true` | 镜像优先以用户本人身份发文本（user_access_token）；无凭据/失败降级 bot 卡。授权见「镜像为用户本人消息」小节 |
 | `authFile` | `~/.cc-bridge-auth.json` | OAuth 凭据落盘路径（chmod 600） |
@@ -138,7 +138,7 @@ daemon 机器把配置 `host` 改为 `0.0.0.0`（并设置 `token`）后 `./serv
 | `POST /hook/permissionrequest` `POST /hook/pretooluse` | 确认类 hook 的 stdin JSON → 挂起等待决策；响应体即 hook stdout（空 = 无意见），按事件返回对应决策 schema |
 | `POST /hook/posttooluse` | 工具已执行 → 严格匹配（会话+工具+参数）结算对应挂起确认，卡片刷为「已在终端允许」；本身不挂起、不发卡 |
 | `POST /hook/notification` | 转通知卡片 |
-| `POST /hook/stop` | 回合结束 → 该会话挂起确认结算为「已在终端处理」；读得到本回合最终输出时另推「🏁 已完成」结果卡（`notifyStop: false` 关闭） |
+| `POST /hook/stop` | 回合结束 → 该会话挂起确认结算为「已在终端处理」；读得到本回合最终输出时另发「🏁 已完成」结果卡（串在来源消息下；`notifyStop: false` 关闭） |
 | `POST /notify` | `{title, body, severity}` 手动推送卡片 |
 | `GET /health` | 状态（免鉴权） |
 | `GET/DELETE /rules` | 查看 / 清空免确认规则 |
@@ -187,7 +187,8 @@ WantedBy=default.target
 
 - **fail-open**：daemon 未启动、网络断开、发卡失败、超时，一律返回空决策（exit 0、无 stdout），Claude Code 回退原生确认流程，永远不会因为 bridge 故障卡死。
 - **本地作答感知**：Claude Code 的 hook 体系没有「确认框已被本地回答」的事件，也不会杀掉仍在阻塞的 hook 进程，因此用 `PostToolUse`（工具确实执行 = 本地允许）与 `Stop`（回合结束 = 兜底）推断；卡片状态翻转走飞书官方「更新已发送的消息卡片」接口（`PATCH /im/v1/messages/:message_id`，前后卡片均声明 `update_multi: true`）。
-- **回合输出卡**：Stop payload 自带 `transcript_path`（会话 JSONL），从后向前取本回合最后一条 assistant 文本（以本回合发起 user 消息为回溯边界，不捞上一轮旧文本）即为该回合最终输出；末行未落盘时隔 300ms 重读一次。读不到（远程机器的本地路径）时不发卡——受理回执卡（若有）收尾为灰色「◌ 回合已结束」，避免「任务中途冒出空泛的已完成」。
+- **回合输出卡**：Stop payload 自带 `transcript_path`（会话 JSONL），从后向前取本回合最后一条 assistant 文本（以本回合发起 user 消息为回溯边界，不捞上一轮旧文本）即为该回合最终输出；末行未落盘时隔 300ms 重读一次。完成时**另发新卡**（受理回执卡永久停留「已开始」，完成状态由新卡承载，聊天记录里「开始→完成」时间线清晰）；读不到输出时若有来源消息发灰色「◌ 回合已结束」收尾卡，无来源不发卡，避免「任务中途冒出空泛的已完成」。
+- **选项读屏对齐**：auto 模式行等 UI 自加选项不出现在 `permission_suggestions` 里，可见性还取决于账号 gate / 当前模式 / 熔断器等运行时状态（同一会话同一模型也会变），从 payload 推不出来。daemon 发卡前用 `herdr agent read` 抓终端当前渲染的确认框文本（hook 阻塞期间对话框就显示在 pane 上），解析「Do you want…」锚点后的编号选项行（折行合并、Tip 提示行不误判）决定卡片按钮集，保证两边一一对应。
 - **顺序与超时对齐**：hook 配置 `timeout: 600` > daemon `timeoutSec`（≤580），保证先由 daemon 超时返回、Claude Code 不会先杀 hook。
 - 决策 schema 按事件区分（均已对照官方 hooks 文档核实）：`PreToolUse` 返回 `hookSpecificOutput.permissionDecision`（allow/deny）；`PermissionRequest` 返回 `hookSpecificOutput.decision.behavior`（allow/deny），`deny` 的原因/消息会反馈给 Claude，建议行/auto 行通过 `decision.updatedPermissions`（数组）回传原生权限更新（addRules / setMode 等，字段见 hooks 文档「Permission update entries」）。
 - 挂起请求用 HTTP 长轮询实现，hook 进程无需额外状态；同一卡片重复回调按 rid 幂等处理。

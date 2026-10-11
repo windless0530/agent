@@ -84,6 +84,16 @@ export function promptAgent(paneId, text, { timeoutMs = 15_000 } = {}) {
   });
 }
 
+/** 读取 agent pane 当前可见文本（终端确认框的 ground truth，解析见 src/dialog.mjs） */
+export function readPane(paneId, { lines = 80, timeoutMs = 5000 } = {}) {
+  if (!paneId) return Promise.resolve('');
+  return run(
+    process.env.HERDR_BIN || 'herdr',
+    ['agent', 'read', paneId, '--source', 'visible', '--format', 'text', '--lines', String(lines)],
+    timeoutMs,
+  ).then((out) => out || '');
+}
+
 function truncateStr(s, n) {
   return s.length > n ? `${s.slice(0, n)}…` : s;
 }

@@ -24,7 +24,7 @@ function hashText(s) {
 }
 
 export function createBridgeState() {
-  const mirrorQueue = new Map(); // session_id -> [{ id, label, ackId }] Stop 结果卡按序配对
+  const mirrorQueue = new Map(); // session_id -> [{ id, label }] Stop 结果新卡按序串在来源下
   const mirroredMsgIds = new Map(); // message_id -> expiresAt
   const injections = new Map(); // `${sid}:${hash}` -> { n, expiresAt }（一次注入一份额度）
   const breaker = new Map(); // `${chatId}:${hash}` -> [ts…]
@@ -43,12 +43,12 @@ export function createBridgeState() {
   }
 
   return {
-    /** 记一条待回复的镜像（或注入来源消息）：label = 指令原文（结果卡标题用），
-     *  ackId = 受理回执卡 message_id（Stop 时直接 patch 它成结果卡） */
-    enqueueMirror(sid, messageId, label = '', ackId = null) {
+    /** 记一条待回复的镜像（或注入来源消息）：label = 指令原文（结果卡标题用）。
+     *  完成时在来源消息下**另发**结果卡——受理回执卡保持「已开始」不改动 */
+    enqueueMirror(sid, messageId, label = '') {
       if (!sid || !messageId) return;
       const q = mirrorQueue.get(sid) || [];
-      q.push({ id: messageId, label, ackId });
+      q.push({ id: messageId, label });
       if (q.length > 10) q.shift();
       mirrorQueue.set(sid, q);
       if (mirrorQueue.size > 100) mirrorQueue.delete(mirrorQueue.keys().next().value);
