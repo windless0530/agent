@@ -259,7 +259,9 @@ export function createBridge({ cfg, messenger }) {
   // ---------- 飞书回调 ----------
 
   async function handleCardAction(data) {
-    const value = data?.action?.value || {};
+    // behaviors 回传的 value 一般是对象，个别回调路径会序列化成 JSON 字符串
+    const raw = data?.action?.value ?? {};
+    const value = typeof raw === 'string' ? JSON.parse(raw) : raw;
     const operator = {
       open_id: data?.operator?.open_id,
       user_id: data?.operator?.user_id,

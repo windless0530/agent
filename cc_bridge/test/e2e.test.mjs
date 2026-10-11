@@ -38,8 +38,8 @@ function post(base, path, body, headers = {}) {
 }
 
 function clickRid(card, act) {
-  const btn = card.body.elements.find((e) => e.tag === 'action').actions.find((b) => b.value.act === act);
-  return btn.value.rid;
+  const btn = card.body.elements.find((e) => e.tag === 'button' && e.behaviors?.[0]?.value?.act === act);
+  return btn.behaviors[0].value.rid;
 }
 
 const BASH_PAYLOAD = {
@@ -259,7 +259,8 @@ test('卡片内容：各工具摘要与按钮 value', async () => {
     session: 'sess-xyz',
     timeoutSec: 300,
   });
-  const acts = card.body.elements.find((e) => e.tag === 'action').actions.map((b) => b.value.act);
+  // schema 2.0 无 action 组件：按钮直接在 elements 里，value 挂在 behaviors 回调上
+  const acts = card.body.elements.filter((e) => e.tag === 'button').map((b) => b.behaviors[0].value.act);
   assert.deepEqual(acts.sort(), ['allow', 'always', 'deny']);
 
   const edit = summarizeTool('Edit', { file_path: '/a/b.py', old_string: 'x', new_string: 'y' });
@@ -277,7 +278,8 @@ test('卡片内容：各工具摘要与按钮 value', async () => {
 
   const notify = buildNotifyCard({ title: 't', message: 'm', severity: 'error' });
   assert.equal(notify.header.template, 'red');
-  assert.equal(notify.body.elements.at(-1).tag, 'note');
+  assert.equal(notify.body.elements.at(-1).tag, 'markdown'); // schema 2.0 无 note,备注行是灰色 markdown
+  assert.match(notify.body.elements.at(-1).content, /grey/);
 });
 
 const PR_PAYLOAD = {

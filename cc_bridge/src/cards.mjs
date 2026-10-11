@@ -65,12 +65,19 @@ export function rulePrefix(tool, input = {}) {
   return '';
 }
 
+/** schema 2.0 按钮用 behaviors 配置回传，点击后 card.action.trigger 会原样带回 value */
 function button(text, type, value) {
-  return { tag: 'button', text: { tag: 'plain_text', content: text }, type, value };
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: text },
+    type,
+    behaviors: [{ type: 'callback', value }],
+  };
 }
 
+/** 卡片 schema 2.0 已移除 note 组件,用灰色富文本模拟备注行 */
 function note(text) {
-  return { tag: 'note', elements: [{ tag: 'plain_text', content: text }] };
+  return { tag: 'markdown', content: `<font color='grey'>${text}</font>` };
 }
 
 /** 待确认交互卡片（schema 2.0） */
@@ -93,14 +100,10 @@ export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec 
     body: {
       elements: [
         { tag: 'markdown', content: lines.join('\n') },
-        {
-          tag: 'action',
-          actions: [
-            button('✅ 允许', 'primary', { rid, act: 'allow' }),
-            button('👍 总是允许', 'turquoise', { rid, act: 'always' }),
-            button('❌ 拒绝', 'danger', { rid, act: 'deny' }),
-          ],
-        },
+        // schema 2.0 已移除 action 组件，按钮直接放在 elements 里（官方文档指引）
+        button('✅ 允许', 'primary', { rid, act: 'allow' }),
+        button('👍 总是允许', 'default', { rid, act: 'always' }),
+        button('❌ 拒绝', 'danger', { rid, act: 'deny' }),
         note(`${now()} · ${timeoutSec}s 未响应将回退为本地确认`),
       ],
     },
