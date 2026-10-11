@@ -501,15 +501,16 @@ test('PermissionRequest：选项个数/文案与终端确认框一致（Yes / �
     const card = t.messenger.sent[0];
     const btns = card.body.elements.filter((e) => e.tag === 'button');
     assert.equal(btns.length, 4); // Yes / 建议行 / auto 行 / No，与终端 4 选项一致
-    // 按钮只放编号 + 固定短文案（飞书按钮限 100 字符且多行居中折行）
+    // 短规则（52 字符）整条放得进单行预算 → 按钮即终端原话，正文无需补全
     assert.equal(btns[0].text.content, '1. Yes');
-    assert.equal(btns[1].text.content, `2. Yes, and don't ask again`);
-    assert.equal(btns[2].text.content, '3. Yes, and switch to auto mode');
+    assert.equal(btns[1].text.content, `2. Yes, and don't ask again for: rm -rf node_modules`);
     assert.equal(btns[3].text.content, '4. No');
+    // 超预算的 auto 行（73 字符）词边界截断，正文补全完整说明
+    assert.match(btns[2].text.content, /^3\. Yes, and switch to auto mode/);
+    assert.ok(btns[2].text.content.endsWith('…'));
     for (const b of btns) assert.ok(b.text.content.length <= 100);
-    // 规则详情 / 模式说明左对齐列在正文，编号与按钮对应
+    assert.doesNotMatch(card.body.elements[0].content, /2\. don't ask again/);
     assert.match(card.body.elements[0].content, /Do you want to proceed\?/);
-    assert.match(card.body.elements[0].content, /2\. don't ask again for: `rm -rf node_modules`/);
     assert.match(card.body.elements[0].content, /3\. auto mode handles these prompts for you/);
     assert.equal(btns[1].behaviors[0].value.act, 'suggest');
     assert.equal(btns[2].behaviors[0].value.act, 'auto');
@@ -565,11 +566,13 @@ test('PermissionRequest：点 auto 选项 → 回传 setMode{auto,session}；模
 test('PermissionRequest：建议合并行按建议内容选 cli.js 模板；垃圾条目被过滤；无建议回退三键', async () => {
   const t = await startBridge({ timeoutSec: 30 });
   try {
-    // setMode 建议 → 按钮短文案 + 正文里的完整模式描述（cli.js 模板文案）
+    // setMode 建议 → 按钮截断的完整文案 + 正文里的完整模式描述（cli.js 模板文案）
     let p = post(t.base, '/hook/permissionrequest', PR_PAYLOAD); // 含 setMode acceptEdits 建议
     await new Promise((r) => setTimeout(r, 150));
     let btn = t.messenger.sent[0].body.elements.find((e) => e.behaviors?.[0]?.value?.act === 'suggest');
-    assert.equal(btn.text.content, '2. Yes, and switch mode');
+    assert.ok(btn.text.content.startsWith('2. Yes, and switch to accept edits'));
+    assert.ok(btn.text.content.endsWith('…'));
+    assert.ok(btn.text.content.length <= 71);
     assert.match(
       t.messenger.sent[0].body.elements[0].content,
       /2\. switch to accept edits \(auto-approve file edits and common file commands\) for this session/,
@@ -590,7 +593,9 @@ test('PermissionRequest：建议合并行按建议内容选 cli.js 模板；垃�
     });
     await new Promise((r) => setTimeout(r, 150));
     btn = t.messenger.sent[1].body.elements.find((e) => e.behaviors?.[0]?.value?.act === 'suggest');
-    assert.equal(btn.text.content, "2. Yes, and don't ask again");
+    assert.ok(btn.text.content.startsWith("2. Yes, and don't ask again for example.com"));
+    assert.ok(btn.text.content.endsWith('…'));
+    assert.ok(btn.text.content.length <= 71);
     assert.match(
       t.messenger.sent[1].body.elements[0].content,
       /2\. don't ask again for example\.com in any project \(user settings\)/,

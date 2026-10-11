@@ -138,25 +138,33 @@ export function suggestionsRowLabel(suggestions, cwd) {
   return `Yes, and don't ask again for ${clip(rules.map(ruleDisplay).join(' and '))}`;
 }
 
+/** 按钮文本字符预算：飞书按钮无对齐属性、按渲染像素折行（居中），折行会把首行顶偏。
+ *  600px 默认卡宽下 Mac 端单行估算容纳 ~72-78 个 ASCII 字符，取 70 留安全余量
+ *  （100 是组件硬上限，但卡 100 在 Mac 端必折行）。超预算时词边界截断加 …，
+ *  完整详情左对齐补在卡片正文里。 */
+const BTN_TEXT_MAX = 70;
+
+/** 按预算截断按钮文案：优先在词边界截断（避免单词切半），边界太靠后才退回硬截断 */
+function clipLabel(text, max) {
+  if (text.length <= max) return text;
+  let s = text.slice(0, max);
+  const sp = s.lastIndexOf(' ');
+  if (sp > max * 0.6) s = s.slice(0, sp);
+  return `${s.trimEnd()}…`;
+}
+
 /**
- * 建议行的「按钮短文案 + 补充说明」。飞书按钮文本上限 100 字符、且无对齐属性
- * （客户端按居中折行渲染，长文案换行后首行会被顶到右边），因此按钮只放固定短文案，
- * 随命令长度变化的规则详情放到卡片 markdown 里左对齐展示，编号与按钮对应。
+ * 建议行的补充说明（cli.js 模板去掉 "Yes, and " 前缀的尾部）：
+ * 按钮完整文案超出单行预算被截断时，把这段详情左对齐补在卡片正文里，编号与按钮对应。
  */
 function suggestionsRowParts(suggestions) {
   const setMode = suggestions.find((s) => s.type === 'setMode');
   if (setMode) {
-    return {
-      short: 'Yes, and switch mode',
-      detail: `switch to ${MODE_DESCRIPTIONS[setMode.mode] || setMode.mode || '?'} for this session`,
-    };
+    return { detail: `switch to ${MODE_DESCRIPTIONS[setMode.mode] || setMode.mode || '?'} for this session` };
   }
   const dirs = suggestions.flatMap((s) => (s.type === 'addDirectories' ? s.directories || [] : []));
   if (dirs.length) {
-    return {
-      short: 'Yes, and always allow access',
-      detail: `always allow access to ${dirs.join(', ')} for this session`,
-    };
+    return { detail: `always allow access to ${dirs.join(', ')} for this session` };
   }
   const rules = suggestions.flatMap((s) => (s.type === 'addRules' ? s.rules || [] : []));
   const domainRules = rules.filter((r) => typeof r?.ruleContent === 'string' && r.ruleContent.startsWith('domain:'));
@@ -165,21 +173,14 @@ function suggestionsRowParts(suggestions) {
       ? ' in any project (user settings)'
       : '';
     return {
-      short: "Yes, and don't ask again",
       detail: `don't ask again for ${domainRules.map((r) => r.ruleContent.slice('domain:'.length)).join(' and ')}${suffix}`,
     };
   }
   const bashRules = rules.filter((r) => r?.toolName === 'Bash');
   if (bashRules.length === rules.length && rules.length) {
-    return {
-      short: "Yes, and don't ask again",
-      detail: `don't ask again for: \`${clip(bashRules.map((r) => r.ruleContent).join(', '), 300)}\``,
-    };
+    return { detail: `don't ask again for: \`${clip(bashRules.map((r) => r.ruleContent).join(', '), 300)}\`` };
   }
-  return {
-    short: "Yes, and don't ask again",
-    detail: `don't ask again for ${clip(rules.map(ruleDisplay).join(' and '), 300)}`,
-  };
+  return { detail: `don't ask again for ${clip(rules.map(ruleDisplay).join(' and '), 300)}` };
 }
 
 /**
@@ -187,13 +188,11 @@ function suggestionsRowParts(suggestions) {
  * auto 模式选项的提供条件对齐 cli.js wTt：当前 permission_mode 为 default/acceptEdits 才显示。
  */
 export function confirmOptions({ suggestions = [], cwd, permissionMode } = {}) {
-  const opts = [{ label: 'Yes', short: 'Yes', type: 'primary', act: 'allow' }];
+  const opts = [{ label: 'Yes', type: 'primary', act: 'allow' }];
   if (suggestions.length) {
-    const parts = suggestionsRowParts(suggestions);
     opts.push({
-      label: suggestionsRowLabel(suggestions, cwd), // 终端原话（结果卡片「所选选项」展示）
-      short: parts.short, // 按钮文案（飞书按钮限 100 字符且多行居中，只放固定短文案）
-      detail: parts.detail, // 规则详情 → 卡片 markdown 左对齐展示
+      label: suggestionsRowLabel(suggestions, cwd), // 终端原话
+      detail: suggestionsRowParts(suggestions).detail, // 按钮截断时的正文补全
       type: 'default',
       act: 'suggest',
       updates: suggestions, // yes-apply-suggestions：全部条目原样回传
@@ -203,14 +202,13 @@ export function confirmOptions({ suggestions = [], cwd, permissionMode } = {}) {
   if (suggestions.length && modeOk) {
     opts.push({
       label: `${AUTO_MODE_LABEL} ${AUTO_MODE_DESC}`,
-      short: AUTO_MODE_LABEL,
       detail: AUTO_MODE_DESC.replace(/^·\s*/, ''),
       type: 'default',
       act: 'auto',
       updates: [AUTO_MODE_UPDATE],
     });
   }
-  opts.push({ label: 'No', short: 'No', type: 'danger', act: 'deny' });
+  opts.push({ label: 'No', type: 'danger', act: 'deny' });
   return opts;
 }
 
@@ -222,8 +220,8 @@ function note(text) {
 /**
  * 待确认交互卡片（schema 2.0）。
  * 带 permission_suggestions 时：选项列表与终端确认框一致（Yes / 合并建议行 /
- * 可选 auto 模式行 / No，带 1. 2. 3. 编号）。规则详情等长文案左对齐列在正文里
- * （文案对照 cli.js 渲染模板），按钮只放编号 + 固定短文案（见 suggestionsRowParts）。
+ * 可选 auto 模式行 / No，带 1. 2. 3. 编号，文案对照 cli.js 渲染模板）。按钮放完整
+ * 文案、按单行预算词边界截断（见 BTN_TEXT_MAX）；放不下的详情左对齐补在正文里。
  * 无 suggestions（旧 CLI / 不读该数组的确认框，如文件编辑）时回退固定三键。
  */
 export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec, suggestions = [], permissionMode }) {
@@ -238,13 +236,12 @@ export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec,
   if (suggestions.length) {
     lines.push('**Do you want to proceed?**');
     const opts = confirmOptions({ suggestions, cwd, permissionMode });
-    // 带补充说明的选项（建议行/auto 行）：详情左对齐列在正文里，编号对应下方按钮
+    const labelOf = (o, i) => `${i + 1}. ${o.label}`;
+    // 完整文案放不进按钮单行预算的选项：详情左对齐补在正文里，编号与按钮对应
     opts.forEach((o, i) => {
-      if (o.detail) lines.push(`${i + 1}. ${o.detail}`);
+      if (labelOf(o, i).length > BTN_TEXT_MAX && o.detail) lines.push(`${i + 1}. ${o.detail}`);
     });
-    // 按钮只放短文案：飞书按钮文本上限 100 字符，且多行文本客户端按居中折行，
-    // 长规则文案会把首行「Yes」顶到右边
-    buttons = opts.map((o, i) => button(`${i + 1}. ${clip(o.short || o.label, 88)}`, o.type, { rid, act: o.act }));
+    buttons = opts.map((o, i) => button(clipLabel(labelOf(o, i), BTN_TEXT_MAX), o.type, { rid, act: o.act }));
   } else {
     buttons = [
       button('✅ 允许', 'primary', { rid, act: 'allow' }),
