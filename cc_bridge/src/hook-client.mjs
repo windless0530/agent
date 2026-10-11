@@ -44,13 +44,21 @@ export async function runHook(event, { url, token, timeoutMs = 590000 }) {
 
   let bodyText = '';
   try {
+    let body = raw || '{}';
+    // daemon 由飞书消息拉起的 claude 会带此环境变量（hook 进程继承）：
+    // 打上标记，daemon 据此抑制该会话的 Stop「任务完成」通知（结果由聊天卡片回复）
+    if (process.env.CC_BRIDGE_FROM_CHAT === '1') {
+      try {
+        body = JSON.stringify({ ...JSON.parse(body), __fromChat: 1 });
+      } catch { /* 原样转发 */ }
+    }
     const res = await fetch(`${url.replace(/\/+$/, '')}/hook/${event}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: raw || '{}',
+      body,
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (res.ok) {

@@ -18,9 +18,10 @@ import {
 } from './src/install.mjs';
 import { runHook } from './src/hook-client.mjs';
 import { createBridge } from './src/server.mjs';
+import { createChatRunner } from './src/agent.mjs';
 import { createMessenger, startEventStream } from './src/feishu.mjs';
 import { buildNotifyCard } from './src/cards.mjs';
-import { log } from './src/util.mjs';
+import { log, shortId } from './src/util.mjs';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
 
@@ -29,6 +30,9 @@ const HELP = `cc-bridge — 把 Claude Code 的确认/授权请求转发到飞�
 用法:
   cc-bridge init                          生成配置模板 ~/.cc-bridge.json
   cc-bridge serve                         启动桥接 daemon（HTTP + 飞书长连接）
+                                          消息驱动：bindings 里绑定的群，消息免 @ 自动
+                                          等价于在绑定目录的终端 claude cli 输入，
+                                          回复发回该群；确认卡也按目录路由到对应群
   cc-bridge install-hooks                 把 hook 写入 Claude Code settings.json
       [--global | --project DIR]          默认 --global
       [--matcher REGEX]                   确认类 hook 的工具匹配，默认: ${DEFAULT_MATCHER}
@@ -94,7 +98,10 @@ async function cmdServe(flags) {
   }
 
   const messenger = createMessenger(cfg);
-  const bridge = createBridge({ cfg, messenger });
+  const chat = cfg.chatEnabled
+    ? createChatRunner({ cfg, messenger, client: messenger.client })
+    : null;
+  const bridge = createBridge({ cfg, messenger, chat });
 
   try {
     await new Promise((resolve, reject) => {
@@ -107,6 +114,12 @@ async function cmdServe(flags) {
   }
   log('serve', `HTTP 服务已启动 http://${cfg.host}:${cfg.port}`);
   log('serve', `等待飞书确认超时: ${cfg.timeoutSec}s，并发上限: ${cfg.maxPending}`);
+  if (chat) {
+    for (const b of cfg.bindings) {
+      log('serve', `消息驱动绑定: 群 ${shortId(b.chatId)} ↔ ${b.cwd}${b.name ? `（${b.name}）` : ''}`);
+    }
+    log('serve', `消息驱动已开启: ${cfg.chatBin}，单条超时 ${cfg.chatTimeoutSec}s（绑定群消息免 @ 自动执行）`);
+  }
 
   try {
     await startEventStream(cfg, {

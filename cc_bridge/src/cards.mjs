@@ -299,3 +299,60 @@ export function buildNotifyCard({ title, message, cwd, severity = 'info' }) {
     },
   };
 }
+
+// ---------- 飞书消息驱动 Claude Code ----------
+
+/** 指令受理回执：先回这张，claude 跑完后 patch 成结果卡片 */
+export function buildChatAckCard({ prompt, queued = false }) {
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: queued ? '⏳ 已排队，等待上一条指令完成' : '🚀 Claude Code 处理中…',
+      },
+      template: queued ? 'yellow' : 'blue',
+    },
+    body: {
+      elements: [
+        { tag: 'markdown', content: truncate(prompt, 800) },
+        note(`${now()} · 完成后本卡片更新为回复 · ${hostname()}`),
+      ],
+    },
+  };
+}
+
+/** 指令结果卡片：把回执卡片 patch 成这个（成功/失败/超时） */
+export function buildChatResultCard({ ok, timedOut, result, error, sessionId, cwd, durationMs, costUsd, numTurns }) {
+  const meta = timedOut
+    ? { title: '⏰ claude 超时', template: 'yellow' }
+    : ok
+      ? { title: '🤖 claude 已回复', template: 'green' }
+      : { title: '⚠️ claude 未成功', template: 'orange' };
+  const body = timedOut ? error : ok ? result || '(无输出)' : result || error || '(无输出)';
+  const stats = [
+    sessionId ? `会话 \`${shortId(sessionId)}\`` : '',
+    cwd ? `\`${truncate(cwd, 80)}\`` : '',
+    durationMs != null ? `${Math.round(Number(durationMs) / 1000)}s` : '',
+    numTurns != null ? `${numTurns} 轮` : '',
+    Number(costUsd) > 0 ? `$${Number(costUsd).toFixed(4)}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: meta.title },
+      template: meta.template,
+    },
+    body: {
+      elements: [
+        { tag: 'markdown', content: truncate(body, 3800) },
+        note(`${now()}${stats ? ` · ${stats}` : ''}`),
+      ],
+    },
+  };
+}

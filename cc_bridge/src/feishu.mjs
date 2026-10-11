@@ -20,12 +20,28 @@ export function createMessenger(cfg) {
   return {
     client,
 
-    /** 发送交互卡片，返回 message_id */
+    /** 发送交互卡片到兜底接收方（peer），返回 message_id */
     async sendCard(card) {
       const resp = await client.im.v1.message.create({
         params: { receive_id_type: receiveIdType },
         data: {
           receive_id: cfg.peer,
+          content: JSON.stringify(card),
+          msg_type: 'interactive',
+        },
+      });
+      if (resp.code !== 0) {
+        throw new Error(`发送卡片失败 code=${resp.code} msg=${resp.msg}`);
+      }
+      return resp.data?.message_id;
+    },
+
+    /** 发送交互卡片到指定群（bindings 路由目标），返回 message_id */
+    async sendCardTo(chatId, card) {
+      const resp = await client.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
           content: JSON.stringify(card),
           msg_type: 'interactive',
         },
@@ -45,6 +61,18 @@ export function createMessenger(cfg) {
       if (resp.code !== 0) {
         throw new Error(`更新卡片失败 code=${resp.code} msg=${resp.msg}`);
       }
+    },
+
+    /** 回复指定消息（引用形式）一张卡片，返回 message_id；用于消息驱动指令的回执 */
+    async replyCard(messageId, card) {
+      const resp = await client.im.v1.message.reply({
+        path: { message_id: messageId },
+        data: { content: JSON.stringify(card), msg_type: 'interactive' },
+      });
+      if (resp.code !== 0) {
+        throw new Error(`回复卡片失败 code=${resp.code} msg=${resp.msg}`);
+      }
+      return resp.data?.message_id;
     },
 
     /** 在指定会话回复纯文本（用于「绑定」引导） */

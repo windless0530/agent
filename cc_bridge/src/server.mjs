@@ -1,7 +1,8 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { log, truncate } from './util.mjs';
+import { log, truncate, shortId } from './util.mjs';
+import { extractText } from './agent.mjs';
 import {
   summarizeTool,
   rulePrefix,
@@ -91,11 +92,20 @@ function readBody(req, limit = 1024 * 1024) {
  * cc-bridge daemon 核心：HTTP 服务 + 挂起请求队列 + 免确认规则。
  * messenger 只需实现 sendCard(card)->messageId 与 updateCard(messageId, card)。
  */
-export function createBridge({ cfg, messenger }) {
+export function createBridge({ cfg, messenger, chat = null }) {
   const pending = new Map(); // rid -> { res, messageId, meta, timer, settled }
   const recentResolved = new Map(); // session_id -> resolve 时间戳（抑制迟到的 permission_prompt 通知）
   const allowRules = parseSeedRules(cfg.allow);
   const state = { ws: 'init', startedAt: Date.now() };
+
+  // ---------- 卡片路由 ----------
+
+  /** 按 cwd 路由发卡：会话目录命中某个 binding → 发到对应群；否则 peer 兜底 */
+  function sendCardRouted(cwd, card) {
+    const target = chat?.chatForCwd(cwd)?.chatId;
+    if (target && messenger.sendCardTo) return messenger.sendCardTo(target, card);
+    return messenger.sendCard(card);
+  }
 
   // ---------- 免确认规则 ----------
 
@@ -201,7 +211,8 @@ export function createBridge({ cfg, messenger }) {
     const rid = crypto.randomUUID();
     let messageId;
     try {
-      messageId = await messenger.sendCard(
+      messageId = await sendCardRouted(
+        payload.cwd,
         buildConfirmCard({
           rid,
           tool,
@@ -246,6 +257,10 @@ export function createBridge({ cfg, messenger }) {
 
   async function handleAlertEvent(req, res, payload, event) {
     const isStop = event === 'stop';
+    // 飞书消息驱动的会话：结果由聊天里的回复卡片给出，Stop 的「任务完成」通知纯重复
+    if (isStop && payload.__fromChat === 1) {
+      return sendJson(res, 200, '');
+    }
     // permission_prompt 类通知在确认框闲置 ~6s 后才触发：此时若该会话已有挂起的
     // 交互确认卡（cc-bridge 已接管审批）或刚被点击解决，纯通知卡纯属重复打扰，抑制；
     // 若两者皆无（发卡失败/并发超限回退本地确认），保留通知作为手机端唯一提醒。
@@ -261,7 +276,8 @@ export function createBridge({ cfg, messenger }) {
     const message =
       payload.message || payload.__raw || payload.title || '(无内容)';
     try {
-      const messageId = await messenger.sendCard(
+      const messageId = await sendCardRouted(
+        payload.cwd,
         buildNotifyCard({
           title,
           message,
@@ -280,7 +296,8 @@ export function createBridge({ cfg, messenger }) {
     if (!payload.title && !payload.body && !payload.message) {
       return sendJson(res, 400, { error: '需要 title 或 body 字段' });
     }
-    const messageId = await messenger.sendCard(
+    const messageId = await sendCardRouted(
+      payload.cwd,
       buildNotifyCard({
         title: payload.title || '📢 cc-bridge 消息',
         message: payload.body || payload.message,
@@ -333,27 +350,40 @@ export function createBridge({ cfg, messenger }) {
   }
 
   async function handleInboundMessage(data) {
-    const msg = data?.event?.message || {};
-    const senderId = data?.event?.sender?.sender_id || {};
+    // SDK 长连接派发时把 v2 事件的 event 体展平到顶层（message/sender 在 data 上）
+    const evt = data?.event?.message ? data.event : data;
+    const msg = evt?.message || {};
+    const senderId = evt?.sender?.sender_id || {};
     const chatId = msg.chat_id;
     log('msg', `收到飞书消息 open_id=${senderId.open_id || '?'} chat_id=${chatId || '?'}`);
 
-    let text = '';
-    try {
-      text = JSON.parse(msg.content || '{}').text || '';
-    } catch { /* 非文本消息 */ }
-
-    if (/绑定|bind/i.test(text) && chatId) {
+    // 「绑定」引导：精确匹配，避免劫持含「绑定」字样的正常指令
+    const text = extractText(msg.content);
+    if (/^(绑定|\/?bind)$/i.test(text) && chatId) {
       await messenger.replyText(
         chatId,
         [
           'cc-bridge 绑定信息：',
           `你的 open_id: ${senderId.open_id}`,
           `本会话 chat_id: ${chatId}`,
-          '将其中一个填入 ~/.cc-bridge.json 的 "peer" 字段后重启 cc-bridge serve 即可。',
+          '在 ~/.cc-bridge.json 的 "bindings" 数组里添加',
+          `{ "chatId": "${chatId}", "cwd": "<repo 本地目录>" }`,
+          '并重启 cc-bridge serve，本群消息即等价于在该目录的终端里输入 claude 指令。',
         ].join('\n'),
       );
       log('msg', '已回复绑定信息');
+      return;
+    }
+
+    // 其余消息交给聊天驱动模块（bindings 绑定的群 → 等价终端输入）
+    if (chat) {
+      try {
+        await chat.handleMessage(data);
+      } catch (e) {
+        log('error', '处理消息指令失败:', e.message);
+      }
+    } else {
+      log('msg', `忽略消息（chatEnabled=false）chat=${shortId(chatId || '')}`);
     }
   }
 
@@ -385,6 +415,7 @@ export function createBridge({ cfg, messenger }) {
           pending: pending.size,
           rules: allowRules.map(describeRule),
           peer: cfg.peer && !/填入/.test(cfg.peer) ? 'configured' : 'missing',
+          chat: chat ? chat.status() : { enabled: false },
           uptimeSec: Math.round((Date.now() - state.startedAt) / 1000),
         });
       }

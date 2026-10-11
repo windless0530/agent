@@ -1,6 +1,6 @@
 # cc-bridge
 
-把任意位置运行的 **Claude Code** 的关键消息（人工确认、工具授权等）通过**飞书交互卡片**推送到手机，在飞书里点「允许 / 拒绝」后 Claude Code 继续执行。
+把任意位置运行的 **Claude Code** 的关键消息（人工确认、工具授权等）通过**飞书交互卡片**推送到手机，在飞书里点「允许 / 拒绝」后 Claude Code 继续执行。也支持**反向驱动**：把「飞书群 ↔ 本地目录」配成一组绑定（`bindings` 配置），绑定群里的消息 = 在该目录的终端 claude cli 里输入，回复直接发回该群；该目录（含子目录）下会话的确认卡也自动路由到对应群——多 repo / 多 worktree 各绑各的群，互不串线。
 
 ```
 Claude Code（任意机器）              cc-bridge daemon（一台机器）             飞书
@@ -8,6 +8,7 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
 │ PreToolUse hook ────┼─────────>│ 挂起请求 → 发送确认卡片 ────┼────────────>│ ⏳ 交互卡片   │
 │ （阻塞等待）         │<─────────│ 等待按钮点击 ←─────────────┼<────────────│ ✅❌ 👍 按钮  │
 │                     │  决策JSON │ Notification → 纯通知卡片  │             │             │
+│ 无头 claude ←────────┼──────────│ 消息 → claude -p --resume ─┼<────────────│ 💬 聊天指令   │
 └────────────────────┘          └──────────────────────────┘             └─────────────┘
 ```
 
@@ -21,6 +22,7 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
 2. 超时（默认 300s）未响应 → 返回空决策，交互式会话回退为本地正常确认流程（**fail-open**，bridge 挂掉也不影响 Claude Code 使用）。注意：headless 等无法弹框的会话中，Claude Code 对「无决策」本身会拒绝该工具调用——手机审批就是这类会话唯一的人工通道。
 3. **选项与终端确认框一一对应**：Claude Code 在 `permission_suggestions` 里给出确认框的选项建议，卡片按 cli.js 同款模板渲染为编号按钮（`1. Yes` / `2. Yes, and don't ask again for: <命令>` / `3. Yes, and switch to auto mode · auto mode handles these prompts for you` / `4. No`，个数与文案与终端一致）。点建议行 = 全部建议原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**；点 auto 行 = 回传 `setMode{auto, session}` 切换会话权限模式。终端上「switch to auto mode」选项本身不带建议条目（UI 自加），卡片据 `permission_mode`（default/acceptEdits 时提供）复原该选项。
    无 `permission_suggestions` 的确认框（如文件编辑类，不读该数组）或旧 CLI 回退为固定三键「✅ 允许 / 👍 总是允许（cc-bridge 内部规则，Bash 按首命令、文件工具按目录，daemon 重启清空）/ ❌ 拒绝」。
+4. **消息驱动 Claude Code**（`chatEnabled`，默认开）：在配置文件 `bindings` 里声明「群 ↔ 目录」绑定后，**绑定群里的文本消息免 @ 自动执行**，等价于在绑定目录的终端 `claude` cli 里输入（单聊不驱动执行）。daemon 收到消息后立刻回一张「🚀 处理中」回执卡，用 `claude -p --output-format json [--resume <sid>]` 无头执行（每个群保留各自上下文），跑完把回执卡更新为回复内容（含耗时/轮数/费用）。同一群串行执行（排队时回执显示「已排队」）。执行过程中的权限确认走上面的交互卡片，并按 `cwd` 路由回**该群**。发「**新会话**」（或 `/new`）丢弃上下文重来；未绑定的群 @机器人 会回复配置提示。这些消息驱动的会话不再收「任务完成」重复通知。
 
 ## 快速开始
 
@@ -32,7 +34,8 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
 |---|---|---|
 | 机器人能力 | 应用能力 → 添加「机器人」 | 发卡片的前提 |
 | `im:message:send_as_bot` | 权限管理 | 以应用身份发消息 |
-| `im.message.receive_v1` 事件 | 事件与回调 → 事件配置 | 用于「绑定」获取你的 open_id |
+| `im.message.receive_v1` 事件 | 事件与回调 → 事件配置 | 接收消息（「绑定」引导 + 消息驱动指令） |
+| 「获取群组中所有消息」（`im:message.group_msg`） | 权限管理 | **绑定群免 @ 自动执行必须**；只开「获取群组中@机器人消息」（`im:message.group_at_msg`）则绑定群也须 @机器人 |
 | **订阅方式：长连接** | 事件与回调 → 订阅方式 | 选「使用长连接接收」，无需公网地址 |
 | 卡片回传交互 | 消息卡片 → 回调配置 → 长连接 | 接收按钮点击（`card.action.trigger`） |
 | 发布版本 | 版本管理与发布 | 未发布应用只能在测试企业与对应用户可用 |
@@ -44,11 +47,12 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
 ```bash
 cd cc_bridge && npm install
 node cli.mjs init          # 生成 ~/.cc-bridge.json
-# 填写 appId / appSecret
+# 填写 appId / appSecret，并在 bindings 里加一组「群 ↔ 目录」：
+#   "bindings": [ { "chatId": "oc_xxx", "cwd": "/root/workspace/myrepo" } ]
 node cli.mjs serve
 ```
 
-获取 `peer`（接收人）：在飞书里给机器人发一条「**绑定**」，daemon 会把你的 `open_id`（私聊）和 `chat_id`（群）回复给你，填进配置里的 `peer` 字段后重启 serve。
+获取群的 `chat_id`：先把机器人拉进群，在群里发一条「**绑定**」，daemon 会把本群 `chat_id`（和你的 `open_id`）回复给你，填进 `bindings` 后重启 serve。不属于任何绑定目录的会话卡片发到 `peer`（兜底接收人，同样可用「绑定」获取，可为空）。
 
 ### 3. 安装 hook 并验证
 
@@ -76,14 +80,19 @@ node cli.mjs install-hooks --url http://<daemon-ip>:3757 --token <token>
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `appId` / `appSecret` | — | 飞书应用凭据（appId 格式为 `cli_` + 16 位十六进制） |
-| `peer` | — | 接收卡片的 `open_id`（ou_）或群 `chat_id`（oc_） |
+| `bindings` | `[]` | **「群 ↔ 目录」绑定列表**：`[{ "chatId": "oc_..", "cwd": "/repo/path", "name": "可选备注" }]`。绑定群消息免 @ 自动在该目录执行 claude；该目录（含子目录）下会话的确认/通知卡也路由到该群（多绑定目录重叠时最长前缀优先） |
+| `peer` | 空 | 兜底接收人：不属于任何绑定目录的会话卡片发这里，`open_id`（ou_）或群 `chat_id`（oc_） |
 | `host` / `port` | `127.0.0.1` / `3757` | HTTP 监听；跨机器接入改 `0.0.0.0` |
 | `timeoutSec` | `300` | 等待飞书确认的超时，上限 580（hook 侧显式配置 600s，保证 daemon 先超时） |
 | `maxPending` | `16` | 同时挂起的确认数上限，超出直接放行走本地流程 |
 | `token` | 空 | hook 客户端与 daemon 之间的 Bearer 共享密钥（跨机器必设） |
-| `allowedOpenIds` | `[]` | 允许点按钮的飞书用户，空为不限制 |
+| `allowedOpenIds` | `[]` | 允许点按钮/发指令的飞书用户，空为不限制（**开启消息驱动建议配置**，否则绑定群里的任何人都能在你机器上跑 claude） |
 | `allow` | `[]` | 预置免确认规则，如 `["Bash:git", "Edit:/src", "WebFetch"]` |
 | `domain` | `feishu` | `lark` 为国际版 |
+| `chatEnabled` | `true` | 飞书消息驱动 Claude Code（按 `bindings` 绑定的群触发） |
+| `chatBin` | `claude` | claude 可执行文件 |
+| `chatModel` | 空 | 额外传给 claude 的 `--model`，空 = 用 claude 默认 |
+| `chatTimeoutSec` | `1800` | 单条消息的 claude 执行超时 |
 
 环境变量等价覆盖：`CC_BRIDGE_APP_ID` / `CC_BRIDGE_APP_SECRET` / `CC_BRIDGE_PEER` / `CC_BRIDGE_URL` / `CC_BRIDGE_TOKEN` / `CC_BRIDGE_CONFIG`。
 
@@ -134,6 +143,8 @@ WantedBy=default.target
 - **长连接日志提示 appId 非法**：appId 必须是 `cli_` + 16 位十六进制，检查是否复制完整。
 - **想让某类操作不询问**：点卡片上的「don't ask again」选项（原生持久化），或配置 `allow` 数组。
 - **hook 触发太频繁**：`install-hooks --matcher 'Bash|Write|Edit'` 自定义工具匹配范围。
+- **绑定群里发消息没反应**：先确认群在 `bindings` 里且已重启 serve（`cc-bridge status` 可看绑定数）；再检查应用权限——没有「获取群组中所有消息」（`im:message.group_msg`）权限时飞书不会把未 @ 的群消息推给应用，此时群里须 @机器人 触发（开「获取群组中@机器人消息」`im:message.group_at_msg` 即可）；单聊不驱动执行（绑定以群为单位）。
+- **消息驱动在哪台机器/目录跑**：在 daemon 所在机器、该群 `bindings` 里绑定的 `cwd` 下执行，和终端里在该目录开 claude 一致；权限确认照常弹卡片，且路由回该群。
 
 ## 设计说明
 

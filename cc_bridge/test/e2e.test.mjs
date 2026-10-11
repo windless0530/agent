@@ -1,23 +1,100 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBridge } from '../src/server.mjs';
-import { buildConfirmCard, buildResultCard, buildNotifyCard, summarizeTool } from '../src/cards.mjs';
+import { createChatRunner, extractText } from '../src/agent.mjs';
+import {
+  buildConfirmCard,
+  buildResultCard,
+  buildNotifyCard,
+  summarizeTool,
+  buildChatAckCard,
+  buildChatResultCard,
+} from '../src/cards.mjs';
+import { waitFor } from '../src/util.mjs';
 
 /** 假 messenger：记录发送与更新，不访问飞书 */
 function fakeMessenger() {
   const sent = [];
+  const sentTo = [];
   const updates = [];
+  const replies = [];
+  const texts = [];
   let n = 0;
   return {
     sent,
+    sentTo,
     updates,
+    replies,
+    texts,
     async sendCard(card) {
       sent.push(card);
+      return `msg_${++n}`;
+    },
+    async sendCardTo(chatId, card) {
+      sentTo.push({ chatId, card });
       return `msg_${++n}`;
     },
     async updateCard(messageId, card) {
       updates.push({ messageId, card });
     },
+    async replyCard(messageId, card) {
+      replies.push({ messageId, card });
+      return `msg_${++n}`;
+    },
+    async replyText(chatId, text) {
+      texts.push({ chatId, text });
+    },
+  };
+}
+
+/** 假 lark client：只实现 daemon 用到的 bot 信息 raw API，形状对齐真实响应 */
+function fakeLarkClient({ botOpenId = 'ou_bot' } = {}) {
+  return {
+    async request({ url }) {
+      if (url === 'open-apis/bot/v3/info') {
+        // 真实响应体是非标准包装 {bot:{open_id}}
+        return { bot: { open_id: botOpenId, app_name: 'cc-bridge' } };
+      }
+      return { code: -1, msg: 'not found' };
+    },
+  };
+}
+
+/**
+ * 构造 im.message.receive_v1 事件报文。
+ * SDK 长连接会把 v2 事件的 event 体展平到顶层后调 handler（message/sender 在 data 上），
+ * 默认按该真实形状构造；wrapped=true 时保留 event 包装（兼容路径）。
+ */
+function msgEvent({
+  chatType = 'p2p',
+  chatId = 'oc_chat1',
+  text,
+  mentions,
+  messageId,
+  sender = 'ou_user',
+  senderType = 'user',
+  messageType = 'text',
+  wrapped = false,
+} = {}) {
+  const event = {
+    sender: { sender_type: senderType, sender_id: { open_id: sender } },
+    message: {
+      message_id: messageId || `om_${Math.random().toString(36).slice(2, 10)}`,
+      chat_id: chatId,
+      chat_type: chatType,
+      message_type: messageType,
+      content: JSON.stringify({ text }),
+      ...(mentions ? { mentions } : {}),
+    },
+  };
+  return wrapped ? { event } : event;
+}
+
+/** 假 runClaude：记录调用参数并返回可预测结果 */
+function fakeRunClaude(runs, resultOf) {
+  return async (args) => {
+    runs.push(args);
+    return resultOf(args);
   };
 }
 
@@ -555,5 +632,311 @@ test('rules 管理：GET /rules 列出，DELETE /rules 清空', async () => {
     assert.deepEqual(g2.rules, []);
   } finally {
     await t.close();
+  }
+});
+
+// ---------- 消息驱动 Claude Code（bindings：群 ↔ 目录） ----------
+
+const CHAT_CFG = {
+  timeoutSec: 30,
+  chatBin: 'claude',
+  chatTimeoutSec: 60,
+  bindings: [
+    { chatId: 'oc_chat1', cwd: '/repo/a' },
+    { chatId: 'oc_chat2', cwd: '/repo/b' },
+  ],
+};
+
+function newRunner({ cfg = {}, client = fakeLarkClient(), runClaude } = {}) {
+  const messenger = fakeMessenger();
+  const runs = [];
+  const runner = createChatRunner({
+    cfg: { ...CHAT_CFG, ...cfg },
+    messenger,
+    client,
+    runClaude: runClaude || fakeRunClaude(runs, (a) => ({
+      ok: true,
+      result: `echo:${a.prompt}`,
+      sessionId: a.sessionId || 'sess-1',
+      numTurns: 1,
+      costUsd: 0.01,
+      durationMs: 5,
+    })),
+  });
+  return { runner, messenger, runs };
+}
+
+test('消息驱动：绑定群消息免 @ 执行（在绑定目录跑 claude）；单聊忽略；会话延续', async () => {
+  const { runner, messenger, runs } = newRunner();
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: ' 查看git状态 ' }));
+  await waitFor(() => messenger.updates.length === 1);
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0].prompt, '查看git状态'); // 压缩空白
+  assert.equal(runs[0].cwd, '/repo/a'); // 在绑定目录执行
+  assert.equal(runs[0].sessionId, ''); // 首条无会话
+  assert.equal(runs[0].env.CC_BRIDGE_FROM_CHAT, '1');
+  // 回执卡片先发（蓝色处理中），跑完 patch 成结果卡片（绿色含回复）
+  assert.equal(messenger.replies[0].card.header.template, 'blue');
+  assert.equal(messenger.updates[0].card.header.template, 'green');
+  assert.match(messenger.updates[0].card.body.elements[0].content, /echo:查看git状态/);
+
+  // 第二条消息带上一条的 session_id（上下文延续）
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '继续' }));
+  await waitFor(() => runs.length === 2);
+  assert.equal(runs[1].sessionId, 'sess-1');
+
+  // 单聊不驱动执行（绑定以群为单位）
+  await runner.handleMessage(msgEvent({ text: '私聊你好' }));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(runs.length, 2);
+
+  // 带 event 包装的形状（兼容路径）也能执行
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '包装形状', messageId: 'om_w1', wrapped: true }));
+  await waitFor(() => runs.length === 3);
+  assert.equal(runs[2].prompt, '包装形状');
+});
+
+test('消息驱动：@占位符剥离；未绑定群 @机器人 → 配置提示；@别人/无@ 静默', async () => {
+  const { runner, messenger, runs } = newRunner();
+  // 绑定群带 @（可有可无）：占位符剥掉后照常执行
+  await runner.handleMessage(msgEvent({
+    chatType: 'group',
+    text: '@_user_1  跑一下测试',
+    mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'cc-bridge' }],
+  }));
+  await waitFor(() => runs.length === 1);
+  assert.equal(runs[0].prompt, '跑一下测试');
+
+  // 未绑定的群 @ 机器人 → 回复 bindings 配置提示
+  await runner.handleMessage(msgEvent({
+    chatType: 'group',
+    chatId: 'oc_other',
+    text: '@_user_1 你好',
+    mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'cc-bridge' }],
+  }));
+  await waitFor(() => messenger.texts.length === 1);
+  assert.match(messenger.texts[0].text, /bindings/);
+  assert.match(messenger.texts[0].text, /oc_other/); // 提示里带本群 chat_id
+  assert.equal(runs.length, 1);
+
+  // 未绑定的群 @ 别人 → 静默；无 @ → 静默
+  await runner.handleMessage(msgEvent({
+    chatType: 'group',
+    chatId: 'oc_other2',
+    text: '@_user_1 你好',
+    mentions: [{ key: '@_user_1', id: { open_id: 'ou_other' }, name: '张三' }],
+  }));
+  await runner.handleMessage(msgEvent({ chatType: 'group', chatId: 'oc_other2', text: '随便聊聊' }));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(runs.length, 1);
+  assert.equal(messenger.texts.length, 1);
+});
+
+test('消息驱动：新会话命令重置上下文；「绑定」命令回复信息；含「绑定」的正常指令不被劫持', async () => {
+  const messenger = fakeMessenger();
+  const runs = [];
+  const runner = createChatRunner({
+    cfg: CHAT_CFG,
+    messenger,
+    client: fakeLarkClient(),
+    runClaude: fakeRunClaude(runs, (a) => ({ ok: true, result: 'r', sessionId: a.sessionId || 's9' })),
+  });
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: 'hi' }));
+  await waitFor(() => runs.length === 1);
+  assert.equal(runs[0].sessionId, '');
+
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '新会话' }));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(runs.length, 1); // 控制命令不进 claude
+  assert.match(messenger.texts[0].text, /已重置/);
+
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: 'again' }));
+  await waitFor(() => runs.length === 2);
+  assert.equal(runs[1].sessionId, ''); // 重置后从新会话开始
+
+  // 经由 server 的绑定分支：精确匹配才回复绑定信息
+  const bridge = createBridge({
+    cfg: { timeoutSec: 30, bindings: CHAT_CFG.bindings },
+    messenger,
+    chat: { handleMessage: async (d) => runner.handleMessage(d) },
+  });
+  await bridge.handleInboundMessage(msgEvent({ chatType: 'group', text: '绑定' }));
+  assert.match(messenger.texts[1].text, /chat_id/);
+  assert.match(messenger.texts[1].text, /bindings/);
+  await bridge.handleInboundMessage(msgEvent({ chatType: 'group', text: '帮我绑定一个 webhook' }));
+  await waitFor(() => runs.length === 3); // 正常指令，交给 claude
+  assert.equal(runs[2].prompt, '帮我绑定一个 webhook');
+});
+
+test('消息驱动：同一会话串行排队，busy 期间回执标记排队', async () => {
+  const messenger = fakeMessenger();
+  const order = [];
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const runner = createChatRunner({
+    cfg: CHAT_CFG,
+    messenger,
+    client: fakeLarkClient(),
+    runClaude: async (a) => {
+      order.push(`start:${a.prompt}`);
+      if (a.prompt === '一') await gate;
+      order.push(`end:${a.prompt}`);
+      return { ok: true, result: a.prompt, sessionId: 's' };
+    },
+  });
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '一', messageId: 'om_1' }));
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '二', messageId: 'om_2' }));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(order, ['start:一']); // 二在排队
+  assert.equal(messenger.replies.length, 2); // 两条回执都已发出
+  assert.equal(messenger.replies[1].card.header.template, 'yellow'); // 排队态
+
+  release();
+  await waitFor(() => order.length === 4);
+  assert.deepEqual(order, ['start:一', 'end:一', 'start:二', 'end:二']); // 严格串行
+  // 一：受理回执→结果；二：受理回执(黄)→开始处理(蓝)→结果(绿)
+  await waitFor(() => messenger.updates.filter((u) => u.card.header.template === 'green').length === 2);
+  assert.equal(messenger.updates[1].card.header.template, 'blue');
+  assert.match(messenger.updates[2].card.body.elements[0].content, /二/);
+});
+
+test('消息驱动：白名单外用户 / 非文本 / 应用消息 / 重复推送被忽略', async () => {
+  const { runner, runs } = newRunner({ cfg: { allowedOpenIds: ['ou_user'] } });
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: 'hi', sender: 'ou_stranger' }));
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: { rich: 1 }, messageType: 'post' }));
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: 'hi', senderType: 'app' }));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(runs.length, 0);
+
+  // 同一 message_id 重推只执行一次
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: 'hi', messageId: 'om_dup' }));
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: 'hi', messageId: 'om_dup' }));
+  await waitFor(() => runs.length === 1);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(runs.length, 1);
+});
+
+test('消息驱动：runClaude 失败/超时 → 回执更新为失败/超时卡片', async () => {
+  const messenger = fakeMessenger();
+  const runner = createChatRunner({
+    cfg: CHAT_CFG,
+    messenger,
+    client: fakeLarkClient(),
+    runClaude: async () => ({ ok: false, timedOut: true, error: '超过 60s 未完成，已终止' }),
+  });
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '慢任务' }));
+  await waitFor(() => messenger.updates.length === 1);
+  const card = messenger.updates[0].card;
+  assert.equal(card.header.template, 'yellow');
+  assert.match(card.header.title.content, /超时/);
+  assert.match(card.body.elements[0].content, /超过 60s/);
+
+  const runner2 = createChatRunner({
+    cfg: CHAT_CFG,
+    messenger,
+    client: fakeLarkClient(),
+    runClaude: async () => ({ ok: false, error: 'claude 退出码 1' }),
+  });
+  await runner2.handleMessage(msgEvent({ chatType: 'group', text: '会失败', chatId: 'oc_chat2', messageId: 'om_2' }));
+  await waitFor(() => messenger.updates.length === 2);
+  assert.equal(messenger.updates[1].card.header.template, 'orange');
+  assert.match(messenger.updates[1].card.body.elements[0].content, /claude 退出码 1/);
+});
+
+test('chatForCwd：绑定目录（含子目录）命中，最长前缀优先，目录边界精确', async () => {
+  const { runner } = newRunner({
+    cfg: {
+      bindings: [
+        { chatId: 'oc_top', cwd: '/repo' },
+        { chatId: 'oc_deep', cwd: '/repo/b' },
+        { chatId: 'oc_other', cwd: '/other' },
+      ],
+    },
+  });
+  assert.equal(runner.chatForCwd('/repo/a/src').chatId, 'oc_top');
+  assert.equal(runner.chatForCwd('/repo/b/x').chatId, 'oc_deep'); // 最长前缀胜出
+  assert.equal(runner.chatForCwd('/repo').chatId, 'oc_top');
+  assert.equal(runner.chatForCwd('/repo2'), null); // 前缀必须是目录边界
+  assert.equal(runner.chatForCwd('/elsewhere'), null);
+  assert.equal(runner.chatForCwd(''), null);
+});
+
+test('卡片路由：确认卡按 cwd 发到绑定群，未命中走 peer 兜底', async () => {
+  const messenger = fakeMessenger();
+  const chat = createChatRunner({ cfg: { ...CHAT_CFG }, messenger, client: fakeLarkClient() });
+  const bridge = createBridge({ cfg: { timeoutSec: 30, peer: 'oc_peer' }, messenger, chat });
+  await new Promise((r) => bridge.server.listen(0, '127.0.0.1', r));
+  const { port } = bridge.server.address();
+  try {
+    // cwd 命中 /repo/a 绑定 → 确认卡发到 oc_chat1 群而非 peer
+    const p = post(`http://127.0.0.1:${port}`, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      cwd: '/repo/a/sub',
+      session_id: 'sess-route-1',
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(messenger.sentTo.length, 1);
+    assert.equal(messenger.sentTo[0].chatId, 'oc_chat1');
+    assert.equal(messenger.sent.length, 0);
+    const rid = clickRid(messenger.sentTo[0].card, 'deny');
+    await bridge.handleCardAction({ action: { value: { rid, act: 'deny' } }, operator: { open_id: 'ou_u' } });
+    const j = JSON.parse(await (await p).text());
+    assert.equal(j.hookSpecificOutput.decision.behavior, 'deny');
+    assert.equal(messenger.updates.length, 1); // 点击后结果卡片照常更新
+
+    // cwd 未命中任何 binding → 通知卡走 peer
+    await post(`http://127.0.0.1:${port}`, '/hook/notification', { message: 'm', cwd: '/elsewhere' });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(messenger.sent.length, 1);
+    assert.equal(messenger.sentTo.length, 1);
+  } finally {
+    bridge.server.close();
+  }
+});
+
+test('卡片内容：回执/结果卡片与 extractText', () => {
+  assert.equal(extractText('{"text":"@_user_1  你好 @_user_2 世界"}'), '你好 世界');
+  assert.equal(extractText('not-json'), '');
+  assert.equal(extractText('{"text":"@_user_1"}'), '');
+
+  const ack = buildChatAckCard({ prompt: 'p', queued: true });
+  assert.equal(ack.header.template, 'yellow');
+  const ok = buildChatResultCard({
+    ok: true, result: '答案', sessionId: 'sess-abc12345', cwd: '/w',
+    durationMs: 1500, costUsd: 0.005, numTurns: 2,
+  });
+  assert.equal(ok.header.template, 'green');
+  assert.match(ok.body.elements[0].content, /答案/);
+  assert.match(ok.body.elements.at(-1).content, /2s.*2 轮/);
+  const fail = buildChatResultCard({ ok: false, error: '崩了' });
+  assert.equal(fail.header.template, 'orange');
+  assert.match(fail.body.elements[0].content, /崩了/);
+});
+
+test('health：包含消息驱动状态；__fromChat 的 stop 事件被抑制', async () => {
+  const messenger = fakeMessenger();
+  const chat = createChatRunner({
+    cfg: { ...CHAT_CFG },
+    messenger,
+    client: fakeLarkClient(),
+    runClaude: async () => ({ ok: true, result: 'r' }),
+  });
+  const bridge = createBridge({ cfg: { timeoutSec: 30, peer: 'oc_x' }, messenger, chat });
+  await new Promise((r) => bridge.server.listen(0, '127.0.0.1', r));
+  const { port } = bridge.server.address();
+  try {
+    const h = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+    assert.equal(h.chat.bindings, 2);
+    assert.equal(h.chat.busy, 0);
+
+    const s = await fetch(`http://127.0.0.1:${port}/hook/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ __fromChat: 1, cwd: '/a' }),
+    });
+    assert.equal((await s.text()).trim(), '');
+    assert.equal(messenger.sent.length, 0); // 无「任务完成」通知卡
+  } finally {
+    bridge.server.close();
   }
 });
