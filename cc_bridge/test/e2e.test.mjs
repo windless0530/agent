@@ -325,12 +325,129 @@ test('PermissionRequest：允许/拒绝返回 decision schema', async () => {
   }
 });
 
-test('PermissionRequest：「总是允许」回传 updatedPermissions，由 Claude Code 原生持久化', async () => {
+test('PermissionRequest：选项个数/文案与终端确认框一致（Yes / 合并建议行 / auto / No）', async () => {
+  const t = await startBridge({ timeoutSec: 30 });
+  try {
+    // 场景对齐用户实例：单条 Bash addRules 建议
+    const p = post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      permission_suggestions: PR_PAYLOAD.permission_suggestions.slice(0, 1),
+      permission_mode: 'default',
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    const card = t.messenger.sent[0];
+    const btns = card.body.elements.filter((e) => e.tag === 'button');
+    assert.equal(btns.length, 4); // Yes / 建议行 / auto 行 / No，与终端 4 选项一致
+    assert.equal(btns[0].text.content, '1. Yes');
+    // 建议行 = 终端原话（cli.js POn 模板），不再笼统为「总是允许」
+    assert.equal(btns[1].text.content, `2. Yes, and don't ask again for: rm -rf node_modules`);
+    assert.equal(btns[2].text.content, '3. Yes, and switch to auto mode · auto mode handles these prompts for you');
+    assert.equal(btns[3].text.content, '4. No');
+    assert.match(card.body.elements[0].content, /Do you want to proceed\?/);
+    assert.equal(btns[1].behaviors[0].value.act, 'suggest');
+    assert.equal(btns[2].behaviors[0].value.act, 'auto');
+
+    // 点建议行：全部建议原样回传（yes-apply-suggestions 语义）
+    await t.bridge.handleCardAction({
+      action: { value: { rid: btns[1].behaviors[0].value.rid, act: 'suggest' } },
+      operator: { open_id: 'ou_u' },
+    });
+    const j = JSON.parse(await (await p).text());
+    assert.deepEqual(j.hookSpecificOutput.decision.updatedPermissions, PR_PAYLOAD.permission_suggestions.slice(0, 1));
+    assert.match(JSON.stringify(t.messenger.updates[0].card), /已允许并记住规则/);
+    assert.match(JSON.stringify(t.messenger.updates[0].card), /所选选项/);
+  } finally {
+    await t.close();
+  }
+});
+
+test('PermissionRequest：点 auto 选项 → 回传 setMode{auto,session}；模式门控对齐 cli.js', async () => {
+  const t = await startBridge({ timeoutSec: 30 });
+  try {
+    let p = post(t.base, '/hook/permissionrequest', PR_PAYLOAD); // permission_mode 缺省按 default
+    await new Promise((r) => setTimeout(r, 150));
+    let rid = clickRid(t.messenger.sent[0], 'auto');
+    await t.bridge.handleCardAction({ action: { value: { rid, act: 'auto' } }, operator: { open_id: 'ou_u' } });
+    let j = JSON.parse(await (await p).text());
+    assert.deepEqual(j.hookSpecificOutput.decision.updatedPermissions, [
+      { type: 'setMode', mode: 'auto', destination: 'session' },
+    ]);
+    assert.match(JSON.stringify(t.messenger.updates[0].card), /切换权限模式/);
+
+    // acceptEdits 下也提供 auto（对齐 cli.js wTt 条件）
+    p = post(t.base, '/hook/permissionrequest', { ...PR_PAYLOAD, permission_mode: 'acceptEdits' });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.ok(clickRid(t.messenger.sent[1], 'auto'));
+
+    // plan 模式不提供 auto
+    p = post(t.base, '/hook/permissionrequest', { ...PR_PAYLOAD, permission_mode: 'plan' });
+    await new Promise((r) => setTimeout(r, 150));
+    const acts = t.messenger.sent[2].body.elements
+      .filter((e) => e.tag === 'button')
+      .map((b) => b.behaviors[0].value.act);
+    assert.deepEqual(acts, ['allow', 'suggest', 'deny']);
+    rid = clickRid(t.messenger.sent[2], 'deny');
+    await t.bridge.handleCardAction({ action: { value: { rid, act: 'deny' } }, operator: { open_id: 'ou_u' } });
+    j = JSON.parse(await (await p).text());
+    assert.equal(j.hookSpecificOutput.decision.behavior, 'deny');
+  } finally {
+    await t.close();
+  }
+});
+
+test('PermissionRequest：建议合并行按建议内容选 cli.js 模板；垃圾条目被过滤；无建议回退三键', async () => {
+  const t = await startBridge({ timeoutSec: 30 });
+  try {
+    // setMode 建议 → 「Yes, and switch to <模式描述> for this session」
+    let p = post(t.base, '/hook/permissionrequest', PR_PAYLOAD); // 含 setMode acceptEdits 建议
+    await new Promise((r) => setTimeout(r, 150));
+    let btn = t.messenger.sent[0].body.elements.find((e) => e.behaviors?.[0]?.value?.act === 'suggest');
+    assert.equal(
+      btn.text.content,
+      '2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session',
+    );
+    let rid = btn.behaviors[0].value.rid;
+    await t.bridge.handleCardAction({ action: { value: { rid, act: 'suggest' } }, operator: { open_id: 'ou_u' } });
+    let j = JSON.parse(await (await p).text());
+    assert.deepEqual(j.hookSpecificOutput.decision.updatedPermissions, PR_PAYLOAD.permission_suggestions); // 全部条目回传
+
+    // 域名规则（WebFetch 类）+ userSettings 后缀；垃圾条目被过滤
+    p = post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      permission_suggestions: [
+        null,
+        'junk',
+        { type: 'addRules', rules: [{ toolName: 'WebFetch', ruleContent: 'domain:example.com' }], behavior: 'allow', destination: 'userSettings' },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    btn = t.messenger.sent[1].body.elements.find((e) => e.behaviors?.[0]?.value?.act === 'suggest');
+    assert.equal(btn.text.content, '2. Yes, and don\'t ask again for example.com in any project (user settings)');
+
+    // 无 suggestions（Edit 对话框不读该数组 / 旧 CLI）→ 固定三键，含「总是允许」
+    p = post(t.base, '/hook/permissionrequest', { ...PR_PAYLOAD, permission_suggestions: undefined });
+    await new Promise((r) => setTimeout(r, 150));
+    const acts = t.messenger.sent[2].body.elements
+      .filter((e) => e.tag === 'button')
+      .map((b) => b.behaviors[0].value.act);
+    assert.deepEqual(acts, ['allow', 'always', 'deny']);
+    rid = clickRid(t.messenger.sent[2], 'always');
+    await t.bridge.handleCardAction({ action: { value: { rid, act: 'always' } }, operator: { open_id: 'ou_u' } });
+    j = JSON.parse(await (await p).text());
+    assert.equal(j.hookSpecificOutput.decision.behavior, 'allow');
+    assert.ok(!j.hookSpecificOutput.decision.updatedPermissions); // 无原生建议 → 不带 updatedPermissions
+  } finally {
+    await t.close();
+  }
+});
+
+test('PermissionRequest：兼容旧卡片 act=always → 回传第一条 addRules 建议 + 内部规则兜底', async () => {
   const t = await startBridge({ timeoutSec: 30 });
   try {
     const p = post(t.base, '/hook/permissionrequest', PR_PAYLOAD);
     await new Promise((r) => setTimeout(r, 150));
-    const rid = clickRid(t.messenger.sent[0], 'always');
+    // 新卡片在有 suggestions 时不再渲染「总是允许」键；此路径只服务升级前已发出的旧卡，直接模拟其点击
+    const rid = clickRid(t.messenger.sent[0], 'deny'); // 任意按钮都带同一 rid
     await t.bridge.handleCardAction({ action: { value: { rid, act: 'always' } }, operator: { open_id: 'ou_u' } });
 
     const j = JSON.parse(await (await p).text());
@@ -371,6 +488,57 @@ test('PermissionRequest：无 suggestions 时「总是允许」仅内部记住�
     // 超时 → 空体 fail-open
     const p2 = await post(t.base, '/hook/permissionrequest', PR_PAYLOAD);
     assert.equal((await p2.text()).trim(), '');
+  } finally {
+    await t.close();
+  }
+});
+
+test('permission_prompt 通知：有挂起确认卡或刚解决时抑制，否则转发', async () => {
+  const t = await startBridge({ timeoutSec: 30 });
+  try {
+    // 会话挂起确认卡期间 → 抑制
+    const p = post(t.base, '/hook/permissionrequest', PR_PAYLOAD);
+    await new Promise((r) => setTimeout(r, 150));
+    const n1 = await post(t.base, '/hook/notification', {
+      notification_type: 'permission_prompt',
+      message: 'Claude needs your permission',
+      session_id: 'sess-pr-1',
+      cwd: '/a',
+    });
+    assert.equal((await n1.text()).trim(), '');
+    assert.equal(t.messenger.sent.length, 1); // 只有确认卡，无重复通知卡
+
+    // 点掉确认卡后 60s 内的迟到通知 → 仍抑制
+    const rid = clickRid(t.messenger.sent[0], 'deny');
+    await t.bridge.handleCardAction({ action: { value: { rid, act: 'deny' } }, operator: { open_id: 'ou_u' } });
+    await p;
+    const n2 = await post(t.base, '/hook/notification', {
+      notification_type: 'permission_prompt',
+      message: 'Claude needs your permission',
+      session_id: 'sess-pr-1',
+      cwd: '/a',
+    });
+    assert.equal((await n2.text()).trim(), '');
+    assert.equal(t.messenger.sent.length, 1);
+
+    // 无挂起且非刚解决（发卡失败/并发超限回退本地确认的场景）→ 转发为唯一提醒
+    const n3 = await post(t.base, '/hook/notification', {
+      notification_type: 'permission_prompt',
+      message: 'Claude needs your permission',
+      session_id: 'sess-other',
+      cwd: '/a',
+    });
+    assert.equal((await n3.text()).trim(), '');
+    assert.equal(t.messenger.sent.length, 2); // 通知卡发出
+
+    // 其它类型通知（idle_prompt 等）不受影响
+    await post(t.base, '/hook/notification', {
+      notification_type: 'idle_prompt',
+      message: 'Claude is waiting for your input',
+      session_id: 'sess-other',
+      cwd: '/a',
+    });
+    assert.equal(t.messenger.sent.length, 3);
   } finally {
     await t.close();
   }

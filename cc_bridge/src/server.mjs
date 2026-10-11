@@ -5,6 +5,7 @@ import { log, truncate } from './util.mjs';
 import {
   summarizeTool,
   rulePrefix,
+  confirmOptions,
   buildConfirmCard,
   buildResultCard,
   buildNotifyCard,
@@ -92,6 +93,7 @@ function readBody(req, limit = 1024 * 1024) {
  */
 export function createBridge({ cfg, messenger }) {
   const pending = new Map(); // rid -> { res, messageId, meta, timer, settled }
+  const recentResolved = new Map(); // session_id -> resolve 时间戳（抑制迟到的 permission_prompt 通知）
   const allowRules = parseSeedRules(cfg.allow);
   const state = { ws: 'init', startedAt: Date.now() };
 
@@ -127,31 +129,43 @@ export function createBridge({ cfg, messenger }) {
 
   // ---------- 挂起请求生命周期 ----------
 
-  async function settle(rid, { act, operator }) {
+  async function settle(rid, { act, operator, choice }) {
     const entry = pending.get(rid);
     if (!entry || entry.settled) return;
     entry.settled = true;
     clearTimeout(entry.timer);
     pending.delete(rid);
     const { res, messageId, meta } = entry;
+    if (meta.session) recentResolved.set(meta.session, Date.now());
     const DENY_REASON = '用户在飞书上拒绝了该操作';
     const isPR = meta.event === 'permissionrequest';
+
+    // 点了 suggest/auto 选项 → 该选项的 updates 数组原样作为 updatedPermissions 回传
+    // （原生持久化/切模式，等同终端选同一选项）；旧三键卡片的「总是允许」仍走兼容路径
+    let nativeUpdate = null;
+    if (isPR) {
+      if (choice?.updates?.length) nativeUpdate = choice.updates;
+      else if (act === 'always') {
+        const u = pickAllowSuggestion(meta.suggestions);
+        if (u) nativeUpdate = [u];
+      }
+    }
+    if (nativeUpdate) meta.nativePersist = true;
 
     // 先回复 hook（Claude Code 侧立即继续），再异步刷新卡片
     if (act === 'deny') {
       sendJson(res, 200, isPR ? permissionrequestDeny(DENY_REASON) : pretooluseDeny(DENY_REASON));
     } else if (act === 'allow' || act === 'always') {
-      const nativeUpdate = act === 'always' && isPR ? pickAllowSuggestion(meta.suggestions) : null;
-      if (nativeUpdate) meta.nativePersist = true;
-      sendJson(res, 200, isPR ? permissionrequestAllow(nativeUpdate ? [nativeUpdate] : undefined) : PRETOOLUSE_ALLOW);
+      sendJson(res, 200, isPR ? permissionrequestAllow(nativeUpdate) : PRETOOLUSE_ALLOW);
     } else if (act === 'timeout') {
       sendJson(res, 200, ''); // fail-open：回退 Claude Code 本地确认
     } else {
       // cancel：客户端连接已断开，无需回复
     }
-    log('resolve', rid, meta.tool, `act=${act}`, operator?.open_id || '');
+    log('resolve', rid, meta.tool, `act=${act}`, choice?.label || '', operator?.open_id || '');
 
     const resultMeta = { ...meta };
+    if (choice) resultMeta.choice = choice;
     if (act === 'always') resultMeta.summary = { ...meta.summary, __ruleHint: describeRule(ruleOf(meta)) };
     messenger
       .updateCard(messageId, buildResultCard(resultMeta, { act, operator }))
@@ -179,6 +193,11 @@ export function createBridge({ cfg, messenger }) {
     }
 
     const summary = summarizeTool(tool, input);
+    // 只保留结构合法的条目，与卡片/回传共用同一数组
+    const suggestions = (Array.isArray(payload.permission_suggestions) ? payload.permission_suggestions : [])
+      .filter((s) => s && typeof s === 'object' && typeof s.type === 'string');
+    // 与终端确认框一致的选项（Yes / 合并建议行 / 可选 auto 行 / No）；按钮与点击处理共用
+    const options = confirmOptions({ suggestions, cwd: payload.cwd, permissionMode: payload.permission_mode });
     const rid = crypto.randomUUID();
     let messageId;
     try {
@@ -190,12 +209,15 @@ export function createBridge({ cfg, messenger }) {
           cwd: payload.cwd,
           session: payload.session_id,
           timeoutSec: cfg.timeoutSec,
+          suggestions,
+          permissionMode: payload.permission_mode,
         }),
       );
     } catch (e) {
       log('error', '发送确认卡片失败，放行走本地流程:', e.message);
       return sendJson(res, 200, '');
     }
+    log('card', `确认卡 ${rid.slice(0, 8)} message_id=${messageId}`);
 
     const entry = {
       res,
@@ -210,7 +232,8 @@ export function createBridge({ cfg, messenger }) {
         cwd: payload.cwd,
         session: payload.session_id,
         event,
-        suggestions: payload.permission_suggestions || [],
+        suggestions,
+        options,
       },
     };
     pending.set(rid, entry);
@@ -223,11 +246,22 @@ export function createBridge({ cfg, messenger }) {
 
   async function handleAlertEvent(req, res, payload, event) {
     const isStop = event === 'stop';
+    // permission_prompt 类通知在确认框闲置 ~6s 后才触发：此时若该会话已有挂起的
+    // 交互确认卡（cc-bridge 已接管审批）或刚被点击解决，纯通知卡纯属重复打扰，抑制；
+    // 若两者皆无（发卡失败/并发超限回退本地确认），保留通知作为手机端唯一提醒。
+    if (event === 'notification' && payload.notification_type === 'permission_prompt') {
+      const recently = Date.now() - (recentResolved.get(payload.session_id) || 0) < 60_000;
+      const hasPending = [...pending.values()].some((e) => e.meta.session === payload.session_id);
+      if (hasPending || recently) {
+        log('notify', `抑制 permission_prompt 通知（会话 ${String(payload.session_id || '').slice(0, 8)} 已由确认卡接管）`);
+        return sendJson(res, 200, '');
+      }
+    }
     const title = isStop ? '🏁 Claude Code 已完成任务' : '🔔 Claude Code 通知';
     const message =
       payload.message || payload.__raw || payload.title || '(无内容)';
     try {
-      await messenger.sendCard(
+      const messageId = await messenger.sendCard(
         buildNotifyCard({
           title,
           message,
@@ -235,6 +269,7 @@ export function createBridge({ cfg, messenger }) {
           severity: isStop ? 'success' : 'info',
         }),
       );
+      log('card', `通知卡 ${event} message_id=${messageId}`);
     } catch (e) {
       log('error', '发送通知卡片失败:', e.message);
     }
@@ -276,8 +311,25 @@ export function createBridge({ cfg, messenger }) {
     }
     if (!pending.has(rid)) return; // 重复回调 / 迟到的点击
 
-    if (act === 'always') addRuleFromRequest(pending.get(rid).meta);
-    await settle(rid, { act: ['allow', 'always', 'deny'].includes(act) ? act : 'timeout', operator });
+    const { meta } = pending.get(rid);
+    if (act === 'always') addRuleFromRequest(meta);
+
+    // suggest / auto：点的是与终端确认框对应的选项，其 updates 原样回传给 Claude Code
+    let choice = null;
+    if (act === 'suggest' || act === 'auto') {
+      const opt = (meta.options || []).find((o) => o.act === act);
+      if (!opt?.updates?.length) return; // 该选项不存在（数据异常），忽略本次点击
+      choice = { label: opt.label, updates: opt.updates };
+    }
+    const normAct =
+      act === 'deny'
+        ? 'deny'
+        : act === 'always'
+          ? 'always'
+          : act === 'allow' || act === 'suggest' || act === 'auto'
+            ? 'allow'
+            : 'timeout';
+    await settle(rid, { act: normAct, operator, choice });
   }
 
   async function handleInboundMessage(data) {

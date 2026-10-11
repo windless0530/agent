@@ -16,10 +16,11 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
 ## 工作原理
 
 1. `cc-bridge install-hooks` 往 Claude Code 的 `settings.json` 写入两类 hook：
-   - 确认类 hook：**`PermissionRequest`**（新版 CLI，自动探测；恰好在 Claude Code 要弹权限确认框时触发，已被允许的操作不会重复打扰）或 **`PreToolUse`**（旧版 CLI 回退，每次工具调用都触发）。hook 进程把工具调用详情 POST 给 daemon 并**阻塞等待**；daemon 发一张带「✅ 允许 / 👍 总是允许 / ❌ 拒绝」按钮的卡片到飞书，你点击后决策以 hook JSON 返回，Claude Code 据此放行或拒绝（拒绝原因会告知 Claude，它会调整方案）。
-   - `Notification`（可选）：Claude 空闲等待输入等通知，转发为纯通知卡片（注意：`permission_prompt` 类通知要等确认框闲置约 6s 才触发，仅作辅助提醒，不承担审批）。
+   - 确认类 hook：**`PermissionRequest`**（新版 CLI，自动探测；恰好在 Claude Code 要弹权限确认框时触发，已被允许的操作不会重复打扰）或 **`PreToolUse`**（旧版 CLI 回退，每次工具调用都触发）。hook 进程把工具调用详情 POST 给 daemon 并**阻塞等待**；daemon 发一张带选项按钮的卡片到飞书，你点击后决策以 hook JSON 返回，Claude Code 据此放行或拒绝（拒绝原因会告知 Claude，它会调整方案）。
+   - `Notification`（可选）：Claude 空闲等待输入等通知，转发为纯通知卡片。其中 `permission_prompt` 类通知（确认框闲置 ~6s 才触发）**在该会话已有挂起确认卡或刚被点击解决的 60s 内自动抑制**，避免与交互确认卡重复打扰；仅当 cc-bridge 未接管审批（发卡失败/并发超限回退本地确认）时才转发，作为手机端唯一提醒。
 2. 超时（默认 300s）未响应 → 返回空决策，交互式会话回退为本地正常确认流程（**fail-open**，bridge 挂掉也不影响 Claude Code 使用）。注意：headless 等无法弹框的会话中，Claude Code 对「无决策」本身会拒绝该工具调用——手机审批就是这类会话唯一的人工通道。
-3. 「👍 总是允许」：PermissionRequest 模式下，若 Claude Code 随请求附带了 `permission_suggestions`，会原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**（等同你在终端确认框里选「总是允许」）；同时 daemon 内也记住规则（Bash 按首命令、文件工具按目录）作为兜底，daemon 重启即清空。
+3. **选项与终端确认框一一对应**：Claude Code 在 `permission_suggestions` 里给出确认框的选项建议，卡片按 cli.js 同款模板渲染为编号按钮（`1. Yes` / `2. Yes, and don't ask again for: <命令>` / `3. Yes, and switch to auto mode · auto mode handles these prompts for you` / `4. No`，个数与文案与终端一致）。点建议行 = 全部建议原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**；点 auto 行 = 回传 `setMode{auto, session}` 切换会话权限模式。终端上「switch to auto mode」选项本身不带建议条目（UI 自加），卡片据 `permission_mode`（default/acceptEdits 时提供）复原该选项。
+   无 `permission_suggestions` 的确认框（如文件编辑类，不读该数组）或旧 CLI 回退为固定三键「✅ 允许 / 👍 总是允许（cc-bridge 内部规则，Bash 按首命令、文件工具按目录，daemon 重启清空）/ ❌ 拒绝」。
 
 ## 快速开始
 
@@ -131,12 +132,12 @@ WantedBy=default.target
 - **装了 hook 但完全不触发**：旧版 Claude Code CLI 不支持 `PermissionRequest` 事件时会被静默忽略，用 `cc-bridge install-hooks --event pretooluse` 回退；`claude --version` 与 `/hooks` 菜单可确认。
 - **卡片能收到但按钮无反应**：飞书后台「消息卡片 → 回调配置」需为**长连接**模式；daemon 日志会打印 `card.action.trigger`。
 - **长连接日志提示 appId 非法**：appId 必须是 `cli_` + 16 位十六进制，检查是否复制完整。
-- **想让某类操作不询问**：点卡片上的「👍 总是允许」，或配置 `allow` 数组。
+- **想让某类操作不询问**：点卡片上的「don't ask again」选项（原生持久化），或配置 `allow` 数组。
 - **hook 触发太频繁**：`install-hooks --matcher 'Bash|Write|Edit'` 自定义工具匹配范围。
 
 ## 设计说明
 
 - **fail-open**：daemon 未启动、网络断开、发卡失败、超时，一律返回空决策（exit 0、无 stdout），Claude Code 回退原生确认流程，永远不会因为 bridge 故障卡死。
 - **顺序与超时对齐**：hook 配置 `timeout: 600` > daemon `timeoutSec`（≤580），保证先由 daemon 超时返回、Claude Code 不会先杀 hook。
-- 决策 schema 按事件区分（均已对照官方 hooks 文档核实）：`PreToolUse` 返回 `hookSpecificOutput.permissionDecision`（allow/deny）；`PermissionRequest` 返回 `hookSpecificOutput.decision.behavior`（allow/deny），`deny` 的原因/消息会反馈给 Claude，「总是允许」通过 `decision.updatedPermissions`（数组）回传原生规则。
+- 决策 schema 按事件区分（均已对照官方 hooks 文档核实）：`PreToolUse` 返回 `hookSpecificOutput.permissionDecision`（allow/deny）；`PermissionRequest` 返回 `hookSpecificOutput.decision.behavior`（allow/deny），`deny` 的原因/消息会反馈给 Claude，建议行/auto 行通过 `decision.updatedPermissions`（数组）回传原生权限更新（addRules / setMode 等，字段见 hooks 文档「Permission update entries」）。
 - 挂起请求用 HTTP 长轮询实现，hook 进程无需额外状态；同一卡片重复回调按 rid 幂等处理。

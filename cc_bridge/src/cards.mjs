@@ -75,19 +75,128 @@ function button(text, type, value) {
   };
 }
 
+// ---------- 确认框选项渲染 ----------
+// 模板逐字对照 Claude Code cli.js 确认框（ConsentRow）的渲染逻辑：
+// 终端把所有 permission_suggestions 合并成「一个」选项，而不是每条一个选项；
+// 点它 = allow + 全部条目原样作为 updatedPermissions 回传。
+
+/** 模式显示名（cli.js br 表），用于 setMode 行「Yes, and switch to <desc> for this session」 */
+const MODE_DESCRIPTIONS = {
+  default: 'default (ask each time)',
+  manual: 'default (ask each time)',
+  acceptEdits: 'accept edits (auto-approve file edits and common file commands)',
+  auto: 'auto (no routine prompts; a reviewer model screens actions)',
+  dontAsk: "don't ask (auto-deny anything that would prompt)",
+  plan: 'plan mode (research and propose changes without making them)',
+  bypassPermissions: 'BYPASS PERMISSIONS (no further prompts)',
+};
+
+/** auto 模式选项（cli.js hpr.workflow + C6e），UI 自加、不出现在 suggestions 里；
+ *  点击等价于回传 kge('auto') 的 applies：setMode{auto, session} */
+const AUTO_MODE_LABEL = 'Yes, and switch to auto mode';
+const AUTO_MODE_DESC = '· auto mode handles these prompts for you';
+export const AUTO_MODE_UPDATE = { type: 'setMode', mode: 'auto', destination: 'session' };
+
+/** 单行截断（truncate() 会附加换行提示，不适合按钮文案） */
+const clip = (t, n = 120) => {
+  t = String(t ?? '');
+  return t.length <= n ? t : `${t.slice(0, n)}…`;
+};
+
+/** 规则显示（cli.js Pn）：有 ruleContent 时 `Tool(rule)`，否则 `Tool` */
+const ruleDisplay = (r) =>
+  r?.ruleContent !== undefined && r?.ruleContent !== null ? `${r?.toolName}(${r?.ruleContent})` : `${r?.toolName}`;
+
+/**
+ * 建议行文案：按建议内容选择与 cli.js 对应的分支模板（xOn / POn / h8t / WebFetch 领域行）。
+ * 返回值就是终端上那个「Yes, and …」选项的原话。
+ */
+export function suggestionsRowLabel(suggestions, cwd) {
+  const setMode = suggestions.find((s) => s.type === 'setMode');
+  if (setMode) {
+    return `Yes, and switch to ${MODE_DESCRIPTIONS[setMode.mode] || setMode.mode || '?'} for this session`;
+  }
+  const dirs = suggestions.flatMap((s) => (s.type === 'addDirectories' ? s.directories || [] : []));
+  if (dirs.length) {
+    return `Yes, and always allow access to ${dirs.join(', ')} for this session`;
+  }
+  const rules = suggestions.flatMap((s) => (s.type === 'addRules' ? s.rules || [] : []));
+  const domainRules = rules.filter((r) => typeof r?.ruleContent === 'string' && r.ruleContent.startsWith('domain:'));
+  if (domainRules.length) {
+    // WebFetch 等域名规则；destination 为 userSettings 时 cli.js 会追加后缀
+    const suffix = suggestions.some((s) => s.destination === 'userSettings')
+      ? ' in any project (user settings)'
+      : '';
+    return `Yes, and don't ask again for ${domainRules.map((r) => r.ruleContent.slice('domain:'.length)).join(' and ')}${suffix}`;
+  }
+  const bashRules = rules.filter((r) => r?.toolName === 'Bash');
+  if (bashRules.length === rules.length && rules.length) {
+    // Bash 简单场景：可编辑前缀行「Yes, and don't ask again for: <prefix>」
+    return `Yes, and don't ask again for: ${bashRules.map((r) => r.ruleContent).join(', ')}`;
+  }
+  // 通用行（MCP 等）：规则显示用 Pn 格式、以 " and " 连接
+  return `Yes, and don't ask again for ${clip(rules.map(ruleDisplay).join(' and '))}`;
+}
+
+/**
+ * 组装与终端确认框一致的选项列表（含顺序与编号素材）。
+ * auto 模式选项的提供条件对齐 cli.js wTt：当前 permission_mode 为 default/acceptEdits 才显示。
+ */
+export function confirmOptions({ suggestions = [], cwd, permissionMode } = {}) {
+  const opts = [{ label: 'Yes', type: 'primary', act: 'allow' }];
+  if (suggestions.length) {
+    opts.push({
+      label: suggestionsRowLabel(suggestions, cwd),
+      type: 'default',
+      act: 'suggest',
+      updates: suggestions, // yes-apply-suggestions：全部条目原样回传
+    });
+  }
+  const modeOk = [undefined, 'default', 'manual', 'acceptEdits'].includes(permissionMode);
+  if (suggestions.length && modeOk) {
+    opts.push({
+      label: `${AUTO_MODE_LABEL} ${AUTO_MODE_DESC}`,
+      type: 'default',
+      act: 'auto',
+      updates: [AUTO_MODE_UPDATE],
+    });
+  }
+  opts.push({ label: 'No', type: 'danger', act: 'deny' });
+  return opts;
+}
+
 /** 卡片 schema 2.0 已移除 note 组件,用灰色富文本模拟备注行 */
 function note(text) {
   return { tag: 'markdown', content: `<font color='grey'>${text}</font>` };
 }
 
-/** 待确认交互卡片（schema 2.0） */
-export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec }) {
+/**
+ * 待确认交互卡片（schema 2.0）。
+ * 带 permission_suggestions 时：选项列表与终端确认框一致（Yes / 合并建议行 /
+ * 可选 auto 模式行 / No，带 1. 2. 3. 编号），文案逐字对照 cli.js 渲染模板。
+ * 无 suggestions（旧 CLI / 不读该数组的确认框，如文件编辑）时回退固定三键。
+ */
+export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec, suggestions = [], permissionMode }) {
   const lines = [
     `**工具**：\`${tool}\`　${summary.headline}`,
     summary.detail,
   ];
   if (cwd) lines.push(`**目录**：\`${truncate(cwd, 200)}\``);
   if (session) lines.push(`**会话**：\`${shortId(session)}\` @ \`${hostname()}\``);
+
+  let buttons;
+  if (suggestions.length) {
+    lines.push('**Do you want to proceed?**');
+    buttons = confirmOptions({ suggestions, cwd, permissionMode }).map((o, i) =>
+      button(`${i + 1}. ${o.label}`, o.type, { rid, act: o.act }),
+    );
+  } else {
+    buttons = [
+      button('✅ 允许', 'primary', { rid, act: 'allow' }),
+      button('👍 总是允许', 'default', { rid, act: 'always' }),
+      button('❌ 拒绝', 'danger', { rid, act: 'deny' }),
+    ];
+  }
 
   return {
     schema: '2.0',
@@ -101,9 +210,7 @@ export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec 
       elements: [
         { tag: 'markdown', content: lines.join('\n') },
         // schema 2.0 已移除 action 组件，按钮直接放在 elements 里（官方文档指引）
-        button('✅ 允许', 'primary', { rid, act: 'allow' }),
-        button('👍 总是允许', 'default', { rid, act: 'always' }),
-        button('❌ 拒绝', 'danger', { rid, act: 'deny' }),
+        ...buttons,
         note(`${now()} · ${timeoutSec}s 未响应将回退为本地确认`),
       ],
     },
@@ -118,9 +225,15 @@ const RESULT_META = {
   cancel: { title: '🚪 已取消（客户端断开）', template: 'grey' },
 };
 
-/** 按钮点击 / 超时后，把原卡片更新为结果态 */
-export function buildResultCard({ tool, summary, cwd, session, nativePersist }, { act, operator }) {
-  const meta = RESULT_META[act] || RESULT_META.timeout;
+/** 点了具体选项（suggest/auto）时，按回传条目类型给结果卡片标题 */
+const choiceTitle = (choice) =>
+  choice?.updates?.[0]?.type === 'setMode' ? '🔄 已允许并切换权限模式' : '👍 已允许并记住规则';
+
+/** 按钮点击 / 超时后，把原卡片更新为结果态；choice = { label, updates } 点中的选项 */
+export function buildResultCard({ tool, summary, cwd, session, nativePersist, choice }, { act, operator }) {
+  const meta = choice
+    ? { title: choiceTitle(choice), template: 'green' }
+    : RESULT_META[act] || RESULT_META.timeout;
   const lines = [
     `**工具**：\`${tool}\`　${summary.headline}`,
     summary.detail,
@@ -133,7 +246,11 @@ export function buildResultCard({ tool, summary, cwd, session, nativePersist }, 
     : operator?.open_id
       ? shortId(operator.open_id, 16)
       : '';
-  if (act === 'always') {
+  if (choice) {
+    lines.push(`**所选选项**：${choice.label}`);
+    if (nativePersist) lines.push('已回传 Claude Code 原生生效（持久化 / 模式切换由其完成）');
+  }
+  if (act === 'always' && !choice) {
     const rule = summary.__ruleHint || '同工具同类操作';
     lines.push(
       nativePersist
