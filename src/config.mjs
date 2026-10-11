@@ -7,10 +7,9 @@ export const DEFAULTS = {
   appSecret: '',
   /** 群 ↔ 工作目录绑定列表：[{ chatId: "oc_..", cwd: "/repo/path" }]。
    * 绑定群里的消息等价于在该目录的终端输入 claude 指令；
-   * 该目录（含子目录）下 Claude Code 会话的确认卡也发到对应群。 */
+   * 该目录（含子目录）下 Claude Code 会话的确认卡也发到对应群。
+   * 没有兜底接收方：未命中任何 binding 的目录一律不发卡、不关联。 */
   bindings: [],
-  /** 兜底消息接收方：不属于任何 binding 目录的会话卡片发这里；用户 open_id（ou_）或群 chat_id（oc_） */
-  peer: '',
   /** HTTP 监听地址；要让其他机器的 Claude Code 接入，改为 0.0.0.0 */
   host: '127.0.0.1',
   port: 3757,
@@ -24,6 +23,9 @@ export const DEFAULTS = {
   allowedOpenIds: [],
   /** 启动时预置的免确认规则，形如 "Bash:git" / "Write" / "Edit:/src" */
   allow: [],
+  /** Stop 事件是否额外发「任务完成」通知卡（默认关：每回合一条纯打扰；
+   *  Stop hook 本身始终安装，用于感知终端本地作答并把挂起卡片刷成已处理态） */
+  notifyStop: false,
   /** 飞书消息驱动 Claude Code 开关（按 bindings 绑定的群触发） */
   chatEnabled: true,
   /** claude 可执行文件，默认 PATH 上的 claude */
@@ -34,6 +36,9 @@ export const DEFAULTS = {
   chatTimeoutSec: 1800,
   /** feishu | lark（国际版） */
   domain: 'feishu',
+  /** 飞书长连接保活看门狗（秒）：ping 后该窗口内无任何入站帧即判定连接死亡并主动重连。
+   *  半开/僵尸连接不会触发 socket 错误，SDK 默认只等 socket 报错——不设看门狗会一直假活 */
+  wsPingTimeoutSec: 120,
   /** hook 客户端连接 daemon 的地址，默认本机端口 */
   clientUrl: '',
 };
@@ -52,7 +57,6 @@ export function templateConfig() {
         cwd: '填入该群绑定的本地目录，如 /root/workspace/myrepo',
       },
     ],
-    peer: '',
     host: DEFAULTS.host,
     port: DEFAULTS.port,
     timeoutSec: DEFAULTS.timeoutSec,
@@ -85,7 +89,6 @@ export function loadConfig(explicit = {}) {
   const env = process.env;
   if (env.CC_BRIDGE_APP_ID) cfg.appId = env.CC_BRIDGE_APP_ID;
   if (env.CC_BRIDGE_APP_SECRET) cfg.appSecret = env.CC_BRIDGE_APP_SECRET;
-  if (env.CC_BRIDGE_PEER) cfg.peer = env.CC_BRIDGE_PEER;
   if (env.CC_BRIDGE_HOST) cfg.host = env.CC_BRIDGE_HOST;
   if (env.CC_BRIDGE_PORT) cfg.port = env.CC_BRIDGE_PORT;
   if (env.CC_BRIDGE_TOKEN) cfg.token = env.CC_BRIDGE_TOKEN;
@@ -93,19 +96,44 @@ export function loadConfig(explicit = {}) {
   if (env.CC_BRIDGE_URL) cfg.clientUrl = env.CC_BRIDGE_URL;
 
   cfg.port = Number(cfg.port) || DEFAULTS.port;
+  cfg.wsPingTimeoutSec = Number(cfg.wsPingTimeoutSec) || DEFAULTS.wsPingTimeoutSec;
   cfg.timeoutSec = Math.min(Number(cfg.timeoutSec) || DEFAULTS.timeoutSec, 580);
   cfg.maxPending = Number(cfg.maxPending) || DEFAULTS.maxPending;
-  // bindings 规整：留合法条目、cwd 转绝对路径、chatId 去重（后出现者优先）
+  // bindings 规整：每条必须同时配置 chatId（oc_ 开头）与 cwd（绝对路径），
+  // 配错/配漏的条目不进入运行时绑定，问题集中收集到 bindingErrors，由
+  // validateServeConfig 在 serve/test 启动时直接报错退出（hook 客户端不受影响）。
+  // local 标记目录是否在 daemon 本机：不在 → 「仅路由」绑定（确认卡照常按目录路由到群，
+  // 但群消息不驱动执行——claude 只能跑在该目录所在的机器上）
   cfg.bindings = Array.isArray(cfg.bindings) ? cfg.bindings : [];
+  const bindingErrors = [];
   const byChat = new Map();
-  for (const b of cfg.bindings) {
-    if (!b || typeof b !== 'object') continue;
+  cfg.bindings.forEach((b, i) => {
+    const label = `bindings[${i}]`;
+    if (!b || typeof b !== 'object') {
+      bindingErrors.push(`${label} 不是对象，应为 { "chatId": "oc_..", "cwd": "/绝对路径" }`);
+      return;
+    }
     const chatId = String(b.chatId || '').trim();
     const cwd = String(b.cwd || '').trim();
-    if (!/^oc_\w+$/.test(chatId) || !cwd) continue;
-    byChat.set(chatId, { chatId, cwd: path.resolve(cwd), ...(b.name ? { name: String(b.name) } : {}) });
-  }
+    const problems = [];
+    if (!chatId || /填入/.test(chatId)) problems.push('chatId 未配置');
+    else if (!/^oc_\w+$/.test(chatId)) problems.push(`chatId 应为 oc_ 开头的群 chat_id（当前: ${chatId}）`);
+    if (!cwd || /填入/.test(cwd)) problems.push('cwd 未配置');
+    else if (!path.isAbsolute(cwd)) problems.push(`cwd 应为绝对路径（当前: ${cwd}）`);
+    if (problems.length) {
+      bindingErrors.push(`${label} ${problems.join('；')}`);
+      return;
+    }
+    // chatId 去重：后出现者优先
+    byChat.set(chatId, {
+      chatId,
+      cwd: path.resolve(cwd),
+      local: fs.existsSync(path.resolve(cwd)),
+      ...(b.name ? { name: String(b.name) } : {}),
+    });
+  });
   cfg.bindings = [...byChat.values()];
+  cfg.bindingErrors = bindingErrors;
   return cfg;
 }
 
@@ -123,18 +151,13 @@ export function validateServeConfig(cfg) {
   if (cfg.appId && !/^cli_[0-9a-fA-F]{16}$/.test(cfg.appId)) {
     errs.push(`appId 格式应为 cli_ + 16 位十六进制（当前: ${cfg.appId}）`);
   }
-  if (!cfg.bindings?.length && (!cfg.peer || /填入/.test(cfg.peer))) {
-    errs.push('bindings（群↔目录绑定）与 peer 至少配置一项');
+  if (!cfg.bindings?.length && !cfg.bindingErrors?.length) {
+    errs.push('bindings 未配置：至少需要一条 { "chatId": "oc_..", "cwd": "/绝对路径" } 绑定（无兜底接收方，未绑定目录不发卡）');
   }
-  for (const b of cfg.bindings || []) {
-    if (/填入/.test(b.cwd) || /填入/.test(b.chatId)) {
-      errs.push('bindings 存在未填写的占位符（chatId / cwd）');
-      break;
-    }
-    if (!fs.existsSync(b.cwd)) {
-      errs.push(`bindings 中目录不存在: ${b.cwd}`);
-    }
-  }
+  // 每条 binding 的 chatId / cwd 缺一不可，配错配漏直接报出（不再静默丢弃）
+  for (const e of cfg.bindingErrors || []) errs.push(e);
+  // 目录不在本机不是错误：作为「仅路由」绑定（hook 上报的 cwd 按字符串前缀路由，
+  // 与路径是否存在于 daemon 本机无关）
   return errs;
 }
 

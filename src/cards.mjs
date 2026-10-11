@@ -223,6 +223,8 @@ const RESULT_META = {
   deny: { title: '❌ 已拒绝', template: 'grey' },
   timeout: { title: '⏰ 已超时，回退本地确认', template: 'yellow' },
   cancel: { title: '🚪 已取消（客户端断开）', template: 'grey' },
+  'local-allow': { title: '🖥️ 已在终端允许', template: 'green' },
+  local: { title: '🖥️ 已在终端处理', template: 'grey' },
 };
 
 /** 点了具体选项（suggest/auto）时，按回传条目类型给结果卡片标题 */
@@ -259,6 +261,9 @@ export function buildResultCard({ tool, summary, cwd, session, nativePersist, ch
     );
   }
   if (who && ['allow', 'always', 'deny'].includes(act)) lines.push(`**操作人**：${who}`);
+  if (act === 'local-allow' || act === 'local') {
+    lines.push('该确认已在 Claude Code 终端处理，卡片按钮已失效');
+  }
 
   return {
     schema: '2.0',

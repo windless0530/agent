@@ -1,5 +1,5 @@
 import lark from '@larksuiteoapi/node-sdk';
-import { log } from './util.mjs';
+import { log, truncate } from './util.mjs';
 
 export function larkDomain(name) {
   return name === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu;
@@ -15,26 +15,8 @@ export function createMessenger(cfg) {
     domain: larkDomain(cfg.domain),
     loggerLevel: lark.LoggerLevel.warn,
   });
-  const receiveIdType = String(cfg.peer || '').startsWith('oc_') ? 'chat_id' : 'open_id';
-
   return {
     client,
-
-    /** 发送交互卡片到兜底接收方（peer），返回 message_id */
-    async sendCard(card) {
-      const resp = await client.im.v1.message.create({
-        params: { receive_id_type: receiveIdType },
-        data: {
-          receive_id: cfg.peer,
-          content: JSON.stringify(card),
-          msg_type: 'interactive',
-        },
-      });
-      if (resp.code !== 0) {
-        throw new Error(`发送卡片失败 code=${resp.code} msg=${resp.msg}`);
-      }
-      return resp.data?.message_id;
-    },
 
     /** 发送交互卡片到指定群（bindings 路由目标），返回 message_id */
     async sendCardTo(chatId, card) {
@@ -99,6 +81,12 @@ export function createMessenger(cfg) {
 export async function startEventStream(cfg, { onCardAction, onMessage }) {
   const dispatcher = new lark.EventDispatcher({}).register({
     'card.action.trigger': async (data) => {
+      // 入站回调落地日志：事件是否到达 daemon 的唯一判据（WS 僵尸/丢事件时此行不会出现）
+      log(
+        'card-cb',
+        `收到卡片回调 value=${truncate(JSON.stringify(data?.action?.value ?? null), 160)}` +
+          ` operator=${data?.operator?.open_id || '?'}`,
+      );
       try {
         await onCardAction(data);
       } catch (e) {
@@ -120,6 +108,11 @@ export async function startEventStream(cfg, { onCardAction, onMessage }) {
     appSecret: cfg.appSecret,
     domain: larkDomain(cfg.domain),
     loggerLevel: lark.LoggerLevel.warn,
+    // 看门狗：半开连接收不到任何入站帧也不报 socket 错误，SDK 默认会一直假活
+    // （卡片回调全丢、出站 REST 正常）。ping 后 pingTimeout 秒无入站帧即断开重连。
+    wsConfig: { pingTimeout: cfg.wsPingTimeoutSec },
+    // 卡在 DNS/代理/NAT 的握手可能无限悬挂，15s 未完成即放弃重试
+    handshakeTimeoutMs: 15000,
     onReady: () => log('ws', '长连接已建立'),
     onError: (e) => log('ws', '长连接错误:', e?.message || e),
     onReconnecting: () => log('ws', '长连接断开，正在重连…'),

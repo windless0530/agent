@@ -96,15 +96,15 @@ export function createBridge({ cfg, messenger, chat = null }) {
   const pending = new Map(); // rid -> { res, messageId, meta, timer, settled }
   const recentResolved = new Map(); // session_id -> resolve 时间戳（抑制迟到的 permission_prompt 通知）
   const allowRules = parseSeedRules(cfg.allow);
-  const state = { ws: 'init', startedAt: Date.now() };
+  const state = { ws: 'init', startedAt: Date.now(), wsStatusProvider: null };
 
   // ---------- 卡片路由 ----------
 
-  /** 按 cwd 路由发卡：会话目录命中某个 binding → 发到对应群；否则 peer 兜底 */
+  /** 按 cwd 路由发卡：会话目录命中某个 binding → 发到对应群；未命中 → null（无兜底，不发） */
   function sendCardRouted(cwd, card) {
     const target = chat?.chatForCwd(cwd)?.chatId;
     if (target && messenger.sendCardTo) return messenger.sendCardTo(target, card);
-    return messenger.sendCard(card);
+    return null;
   }
 
   // ---------- 免确认规则 ----------
@@ -167,8 +167,9 @@ export function createBridge({ cfg, messenger, chat = null }) {
       sendJson(res, 200, isPR ? permissionrequestDeny(DENY_REASON) : pretooluseDeny(DENY_REASON));
     } else if (act === 'allow' || act === 'always') {
       sendJson(res, 200, isPR ? permissionrequestAllow(nativeUpdate) : PRETOOLUSE_ALLOW);
-    } else if (act === 'timeout') {
-      sendJson(res, 200, ''); // fail-open：回退 Claude Code 本地确认
+    } else if (act === 'timeout' || act === 'local-allow' || act === 'local') {
+      // fail-open：无决策返回，Claude Code 继续走它本地已完成的流程
+      sendJson(res, 200, '');
     } else {
       // cancel：客户端连接已断开，无需回复
     }
@@ -185,6 +186,48 @@ export function createBridge({ cfg, messenger, chat = null }) {
   function ruleOf(meta) {
     return { tool: meta.tool, prefix: rulePrefix(meta.tool, meta.input) };
   }
+
+  // ---------- 终端本地作答感知 ----------
+  // Claude Code 不会因为用户在终端本地回答了确认框而通知 hook（hook 进程也不被杀），
+  // 飞书卡片只能靠以下事件推断「已在本地解决」：
+  //   PostToolUse：同一会话同工具同参数的工具确实执行了 → 本地允许（严格匹配，避免
+  //               并行同工具任务误伤；每次执行只结算一条挂起）
+  //   Stop：回合结束 → 该会话剩余挂起确认一律视为已在本地处理（允许/拒绝/Esc 兜底）
+  // 结算时向仍挂起的 hook 连接回空体（fail-open），hook 进程随即退出，卡片刷为结果态。
+
+  /** 键序无关的稳定 JSON 序列化，用于 tool_input 等值比较 */
+  function canonicalJson(v) {
+    if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
+    if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+    return `{${Object.keys(v)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`)
+      .join(',')}}`;
+  }
+
+  function settleLocalFromPostToolUse(payload) {
+    const sid = payload.session_id;
+    if (!sid) return 0;
+    const match = [...pending.entries()].find(
+      ([, e]) =>
+        !e.settled &&
+        e.meta.session === sid &&
+        e.meta.tool === payload.tool_name &&
+        canonicalJson(e.meta.input) === canonicalJson(payload.tool_input),
+    );
+    if (!match) return 0;
+    settle(match[0], { act: 'local-allow' });
+    return 1;
+  }
+
+  function settleLocalFromStop(payload) {
+    const sid = payload.session_id;
+    if (!sid) return 0;
+    const matches = [...pending.entries()].filter(([, e]) => !e.settled && e.meta.session === sid);
+    for (const [rid] of matches) settle(rid, { act: 'local' });
+    return matches.length;
+  }
+
 
   // ---------- hook 事件处理 ----------
 
@@ -228,6 +271,10 @@ export function createBridge({ cfg, messenger, chat = null }) {
       log('error', '发送确认卡片失败，放行走本地流程:', e.message);
       return sendJson(res, 200, '');
     }
+    if (!messageId) {
+      log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，不发确认卡，放行走本地流程`);
+      return sendJson(res, 200, '');
+    }
     log('card', `确认卡 ${rid.slice(0, 8)} message_id=${messageId}`);
 
     const entry = {
@@ -257,9 +304,16 @@ export function createBridge({ cfg, messenger, chat = null }) {
 
   async function handleAlertEvent(req, res, payload, event) {
     const isStop = event === 'stop';
-    // 飞书消息驱动的会话：结果由聊天里的回复卡片给出，Stop 的「任务完成」通知纯重复
-    if (isStop && payload.__fromChat === 1) {
-      return sendJson(res, 200, '');
+    if (isStop) {
+      // 回合结束：该会话仍挂起的确认视为已在终端本地处理（允许/拒绝/Esc 的统一兜底）
+      const n = settleLocalFromStop(payload);
+      if (n) log('resolve', `Stop：会话 ${shortId(payload.session_id)} 的 ${n} 个挂起确认已在终端处理`);
+      // 飞书消息驱动的会话：结果由聊天里的回复卡片给出，Stop 的「任务完成」通知纯重复
+      if (payload.__fromChat === 1) {
+        return sendJson(res, 200, '');
+      }
+      // 「任务完成」通知默认关（每回合一条纯属打扰），notifyStop: true 打开
+      if (!cfg.notifyStop) return sendJson(res, 200, '');
     }
     // permission_prompt 类通知在确认框闲置 ~6s 后才触发：此时若该会话已有挂起的
     // 交互确认卡（cc-bridge 已接管审批）或刚被点击解决，纯通知卡纯属重复打扰，抑制；
@@ -285,7 +339,8 @@ export function createBridge({ cfg, messenger, chat = null }) {
           severity: isStop ? 'success' : 'info',
         }),
       );
-      log('card', `通知卡 ${event} message_id=${messageId}`);
+      if (messageId) log('card', `通知卡 ${event} message_id=${messageId}`);
+      else log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，跳过 ${event} 通知卡`);
     } catch (e) {
       log('error', '发送通知卡片失败:', e.message);
     }
@@ -305,6 +360,9 @@ export function createBridge({ cfg, messenger, chat = null }) {
         severity: payload.severity || 'info',
       }),
     );
+    if (!messageId) {
+      return sendJson(res, 400, { error: `cwd ${payload.cwd || '(空)'} 未命中任何 binding，无发送目标` });
+    }
     sendJson(res, 200, { ok: true, message_id: messageId });
   }
 
@@ -320,13 +378,19 @@ export function createBridge({ cfg, messenger, chat = null }) {
       name: data?.operator?.name,
     };
     const { rid, act } = value;
-    if (!rid || !act) return;
+    if (!rid || !act) {
+      log('card-cb', '回调缺少 rid/act，忽略:', truncate(JSON.stringify(value), 120));
+      return;
+    }
 
     if (cfg.allowedOpenIds?.length && !cfg.allowedOpenIds.includes(operator.open_id)) {
       log('warn', `忽略未授权用户 ${operator.open_id} 的卡片点击`);
       return;
     }
-    if (!pending.has(rid)) return; // 重复回调 / 迟到的点击
+    if (!pending.has(rid)) {
+      log('card-cb', `忽略点击：${rid.slice(0, 8)} 不在待确认队列（已解决/超时后的重复点击）`);
+      return;
+    }
 
     const { meta } = pending.get(rid);
     if (act === 'always') addRuleFromRequest(meta);
@@ -409,12 +473,15 @@ export function createBridge({ cfg, messenger, chat = null }) {
     const url = new URL(req.url, 'http://localhost');
     try {
       if (req.method === 'GET' && url.pathname === '/health') {
+        const wsStatus = state.wsStatusProvider?.() || null;
         return sendJson(res, 200, {
           ok: true,
-          ws: state.ws,
+          // 优先用 SDK 实时状态（connected/reconnecting/failed + 重连计数），
+          // 标志位只是回退——僵尸连接时标志位仍显示 connected，具有误导性
+          ws: wsStatus ? wsStatus.state : state.ws,
+          ...(wsStatus ? { wsDetail: wsStatus } : {}),
           pending: pending.size,
           rules: allowRules.map(describeRule),
-          peer: cfg.peer && !/填入/.test(cfg.peer) ? 'configured' : 'missing',
           chat: chat ? chat.status() : { enabled: false },
           uptimeSec: Math.round((Date.now() - state.startedAt) / 1000),
         });
@@ -427,7 +494,13 @@ export function createBridge({ cfg, messenger, chat = null }) {
         if (event === 'pretooluse' || event === 'permissionrequest') {
           return await handleConfirmation(req, res, payload, event);
         }
-        if (['notification', 'stop', 'posttooluse', 'sessionstart'].includes(event)) {
+        if (event === 'posttooluse') {
+          // 工具已执行 = 对应确认在终端被本地允许：结算挂起卡（不发通知卡）
+          const n = settleLocalFromPostToolUse(payload);
+          if (n) log('resolve', `PostToolUse：${payload.tool_name} 已在终端允许，结算挂起确认`);
+          return sendJson(res, 200, '');
+        }
+        if (['notification', 'stop', 'sessionstart'].includes(event)) {
           return await handleAlertEvent(req, res, payload, event);
         }
         return sendJson(res, 404, { error: `unknown hook event: ${event}` });
@@ -457,6 +530,9 @@ export function createBridge({ cfg, messenger, chat = null }) {
     handleInboundMessage,
     setWsState: (s) => {
       state.ws = s;
+    },
+    setWsStatusProvider: (fn) => {
+      state.wsStatusProvider = fn;
     },
     pendingSize: () => pending.size,
     rules: () => allowRules,

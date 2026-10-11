@@ -7,8 +7,8 @@ import { configPath, templateConfig } from './config.mjs';
 
 export const DEFAULT_MATCHER = 'Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|WebSearch|mcp__.*';
 
-/** 这两个事件的 matcher 都是工具名，且都要挂起等确认 */
-const CONFIRM_EVENTS = ['PreToolUse', 'PermissionRequest'];
+/** matcher 按工具名过滤的事件：确认类 + PostToolUse（本地允许信号，与确认同一匹配范围） */
+const TOOL_MATCHER_EVENTS = ['PreToolUse', 'PermissionRequest', 'PostToolUse'];
 
 /**
  * 探测本机 Claude Code CLI 是否支持 PermissionRequest hook（v2.1.x 引入）。
@@ -30,8 +30,10 @@ export function supportsPermissionRequest() {
 /**
  * 生成 hook 命令：本机用 node 直调，远程用 curl（只要装了 curl）。
  * confirmEvent: 'permissionrequest'（新 CLI，只在真正要弹确认框时触发）或 'pretooluse'（旧 CLI 兼容）。
+ * PostToolUse / Stop 常驻安装：用户在终端本地回答确认框后 Claude Code 不会通知 hook，
+ * daemon 靠这两个事件得知（工具已执行=本地允许 / 回合结束=兜底），把飞书卡片刷成已处理态。
  */
-export function buildHookCommands({ cliPath, url, token, withStop, confirmEvent = 'pretooluse' }) {
+export function buildHookCommands({ cliPath, url, token, confirmEvent = 'pretooluse' }) {
   const mk = (event, timeout) => {
     if (url) {
       const auth = token ? ` -H 'Authorization: Bearer ${token}'` : '';
@@ -42,9 +44,10 @@ export function buildHookCommands({ cliPath, url, token, withStop, confirmEvent 
   const confirmKey = confirmEvent === 'permissionrequest' ? 'PermissionRequest' : 'PreToolUse';
   const cmds = {
     [confirmKey]: { event: confirmEvent, timeout: 600 },
+    PostToolUse: { event: 'posttooluse', timeout: 60 },
     Notification: { event: 'notification', timeout: 60 },
+    Stop: { event: 'stop', timeout: 60 },
   };
-  if (withStop) cmds.Stop = { event: 'stop', timeout: 60 };
   const out = {};
   for (const [k, v] of Object.entries(cmds)) out[k] = { command: mk(v.event, v.timeout), timeout: v.timeout };
   return out;
@@ -53,7 +56,7 @@ export function buildHookCommands({ cliPath, url, token, withStop, confirmEvent 
 function isOurHookCommand(command) {
   return (
     /cc[-_]bridge/.test(command) ||
-    /\/hook\/(pretooluse|permissionrequest|notification|stop)/.test(command)
+    /\/hook\/(pretooluse|permissionrequest|posttooluse|notification|stop)/.test(command)
   );
 }
 
@@ -88,7 +91,7 @@ export function installHooks({ file, commands, matcher = DEFAULT_MATCHER, dryRun
     const list = settings.hooks[event] || [];
     const kept = list.filter((e) => !isOurEntry(e));
     const entry = {
-      matcher: CONFIRM_EVENTS.includes(event) ? matcher : '',
+      matcher: TOOL_MATCHER_EVENTS.includes(event) ? matcher : '',
       hooks: [{ type: 'command', command, timeout }],
     };
     kept.push(entry);

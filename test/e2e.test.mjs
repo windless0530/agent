@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBridge } from '../src/server.mjs';
+import { loadConfig, validateServeConfig } from '../src/config.mjs';
 import { createChatRunner, extractText } from '../src/agent.mjs';
 import {
   buildConfirmCard,
@@ -12,7 +13,7 @@ import {
 } from '../src/cards.mjs';
 import { waitFor } from '../src/util.mjs';
 
-/** 假 messenger：记录发送与更新，不访问飞书 */
+/** 假 messenger：记录发送与更新，不访问飞书（无 peer 通道，只有定向发送） */
 function fakeMessenger() {
   const sent = [];
   const sentTo = [];
@@ -26,11 +27,8 @@ function fakeMessenger() {
     updates,
     replies,
     texts,
-    async sendCard(card) {
-      sent.push(card);
-      return `msg_${++n}`;
-    },
     async sendCardTo(chatId, card) {
+      sent.push(card);
       sentTo.push({ chatId, card });
       return `msg_${++n}`;
     },
@@ -98,9 +96,15 @@ function fakeRunClaude(runs, resultOf) {
   };
 }
 
-async function startBridge(cfg) {
+/** 默认绑定：BASH_PAYLOAD / PR_PAYLOAD 的 cwd 都在 /home/user/project 下 */
+const DEFAULT_BINDING = { chatId: 'oc_t', cwd: '/home/user/project' };
+
+async function startBridge(cfg = {}) {
   const messenger = fakeMessenger();
-  const bridge = createBridge({ cfg, messenger });
+  const merged = { ...cfg, bindings: [...(cfg.bindings || []), DEFAULT_BINDING] };
+  // 卡片路由依赖 chat runner 的 chatForCwd，必须一并挂上
+  const chat = createChatRunner({ cfg: merged, messenger, client: fakeLarkClient() });
+  const bridge = createBridge({ cfg: merged, messenger, chat });
   await new Promise((resolve) => bridge.server.listen(0, '127.0.0.1', resolve));
   const { port } = bridge.server.address();
   return { bridge, messenger, base: `http://127.0.0.1:${port}`, async close() { bridge.server.close(); } };
@@ -236,6 +240,63 @@ test('客户端提前断开：挂起请求取消，卡片标记取消', async ()
   }
 });
 
+test('终端本地作答：PostToolUse 严格匹配 → 结算挂起并刷卡；Stop 兜底其余', async () => {
+  const t = await startBridge({ timeoutSec: 30 });
+  try {
+    // 1) 同会话同工具同参数（键序不同也算相等）的工具已执行 → 本地允许
+    const p1 = post(t.base, '/hook/pretooluse', BASH_PAYLOAD);
+    await new Promise((r) => setTimeout(r, 150));
+    const rid1 = clickRid(t.messenger.sent[0], 'deny');
+    const ptu = await post(t.base, '/hook/posttooluse', {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Bash',
+      tool_input: { description: '清理临时目录', command: 'rm -rf /tmp/x && echo done' }, // 键序不同
+      cwd: '/home/user/project',
+      session_id: 'sess-abcdef123456',
+    });
+    assert.equal((await ptu.text()).trim(), ''); // PostToolUse 本身无决策、不挂起
+    assert.equal((await p1.then((r) => r.text())).trim(), ''); // 挂起的确认请求 fail-open 空体释放
+    assert.equal(t.bridge.pendingSize(), 0);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.match(t.messenger.updates[0].card.header.title.content, /已在终端允许/);
+    assert.equal(t.messenger.updates[0].card.header.template, 'green');
+    assert.match(JSON.stringify(t.messenger.updates[0].card), /按钮已失效/);
+    assert.equal(t.messenger.sent.length, 1); // 不发任何通知卡
+
+    // 本地结算后的迟到点击被忽略（rid 已出队）
+    await t.bridge.handleCardAction({ action: { value: { rid: rid1, act: 'deny' } }, operator: { open_id: 'ou_u' } });
+    assert.equal(t.messenger.updates.length, 1);
+
+    // 2) 参数不匹配的 PostToolUse 不结算（并行同工具任务不误伤）
+    const p2 = post(t.base, '/hook/pretooluse', BASH_PAYLOAD);
+    await new Promise((r) => setTimeout(r, 150));
+    await post(t.base, '/hook/posttooluse', {
+      tool_name: 'Bash',
+      tool_input: { command: 'npm install' },
+      session_id: 'sess-abcdef123456',
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(t.bridge.pendingSize(), 1); // 仍挂起
+
+    // 其它会话的 Stop 也不结算
+    await post(t.base, '/hook/stop', { session_id: 'sess-other', cwd: '/home/user/project' });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(t.bridge.pendingSize(), 1);
+
+    // 3) 本会话 Stop（回合结束）→ 兜底结算为「已在终端处理」
+    const stop = await post(t.base, '/hook/stop', { session_id: 'sess-abcdef123456', cwd: '/home/user/project' });
+    assert.equal((await stop.text()).trim(), '');
+    assert.equal((await p2.then((r) => r.text())).trim(), '');
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(t.bridge.pendingSize(), 0);
+    assert.match(t.messenger.updates[1].card.header.title.content, /已在终端处理/);
+    assert.equal(t.messenger.updates[1].card.header.template, 'grey');
+    assert.equal(t.messenger.sent.length, 2); // 只有确认卡，无 stop 通知卡（notifyStop 默认关）
+  } finally {
+    await t.close();
+  }
+});
+
 test('allowedOpenIds 白名单外的点击被忽略', async () => {
   const t = await startBridge({ timeoutSec: 30, allowedOpenIds: ['ou_allowed'] });
   try {
@@ -288,19 +349,41 @@ test('token 鉴权：无凭据 401，带 Bearer 正常', async () => {
   }
 });
 
-test('notification / stop / notify 事件：只发通知卡片不挂起', async () => {
+test('notification / stop / notify 事件：按 binding 路由发卡；未命中不发也不挂起', async () => {
   const t = await startBridge({ timeoutSec: 30 });
   try {
-    const n = await post(t.base, '/hook/notification', { message: 'Claude is waiting for your input', cwd: '/a' });
+    const n = await post(t.base, '/hook/notification', { message: 'Claude is waiting for your input', cwd: '/home/user/project' });
     assert.equal((await n.text()).trim(), '');
-    const s = await post(t.base, '/hook/stop', { cwd: '/a' });
+    // notifyStop 默认关：Stop 只用于结算挂起确认，不发「任务完成」卡
+    const s = await post(t.base, '/hook/stop', { cwd: '/home/user/project' });
     assert.equal((await s.text()).trim(), '');
-    const m = await post(t.base, '/notify', { title: '手动通知', body: 'hello', severity: 'warn' });
+    const m = await post(t.base, '/notify', { title: '手动通知', body: 'hello', severity: 'warn', cwd: '/home/user/project' });
     const mj = JSON.parse(await m.text());
     assert.equal(mj.ok, true);
-    assert.equal(t.messenger.sent.length, 3);
-    assert.equal(t.messenger.sent[2].header.template, 'orange'); // severity warn
+    assert.equal(t.messenger.sent.length, 2); // 通知卡 + 手动通知卡，无 stop 卡
+    assert.equal(t.messenger.sent[1].header.template, 'orange'); // severity warn
+    assert.ok(t.messenger.sentTo.every((x) => x.chatId === 'oc_t')); // 全部路由到默认绑定群
     assert.equal(t.bridge.pendingSize(), 0);
+
+    // 未命中 binding：通知事件静默跳过（不发卡），/notify 明确报 400
+    const n2 = await post(t.base, '/hook/notification', { message: 'x', cwd: '/elsewhere' });
+    assert.equal((await n2.text()).trim(), '');
+    assert.equal(t.messenger.sent.length, 2);
+    const bad = await post(t.base, '/notify', { title: 'x', body: 'y', cwd: '/elsewhere' });
+    assert.equal(bad.status, 400);
+  } finally {
+    await t.close();
+  }
+});
+
+test('notifyStop: true 时 Stop 事件发「任务完成」通知卡', async () => {
+  const t = await startBridge({ timeoutSec: 30, notifyStop: true });
+  try {
+    const s = await post(t.base, '/hook/stop', { cwd: '/home/user/project', session_id: 'sess-none' });
+    assert.equal((await s.text()).trim(), '');
+    assert.equal(t.messenger.sent.length, 1);
+    assert.match(t.messenger.sent[0].header.title.content, /完成/);
+    assert.equal(t.messenger.sent[0].header.template, 'green');
   } finally {
     await t.close();
   }
@@ -308,10 +391,13 @@ test('notification / stop / notify 事件：只发通知卡片不挂起', async 
 
 test('sendCard 失败：fail-open 返回空响应', async () => {
   const messenger = {
-    async sendCard() { throw new Error('boom'); },
+    async sendCardTo() { throw new Error('boom'); },
     async updateCard() {},
   };
-  const bridge = createBridge({ cfg: { timeoutSec: 30 }, messenger });
+  const bridge = createBridge({
+    cfg: { timeoutSec: 30, bindings: [{ chatId: 'oc_t', cwd: '/home/user/project' }] },
+    messenger,
+  });
   await new Promise((r) => bridge.server.listen(0, '127.0.0.1', r));
   const { port } = bridge.server.address();
   try {
@@ -571,7 +657,8 @@ test('PermissionRequest：无 suggestions 时「总是允许」仅内部记住�
 });
 
 test('permission_prompt 通知：有挂起确认卡或刚解决时抑制，否则转发', async () => {
-  const t = await startBridge({ timeoutSec: 30 });
+  // 额外绑定 /a：转发场景的通知卡需要命中 binding 才有发送目标
+  const t = await startBridge({ timeoutSec: 30, bindings: [{ chatId: 'oc_f', cwd: '/a' }] });
   try {
     // 会话挂起确认卡期间 → 抑制
     const p = post(t.base, '/hook/permissionrequest', PR_PAYLOAD);
@@ -633,6 +720,35 @@ test('rules 管理：GET /rules 列出，DELETE /rules 清空', async () => {
   } finally {
     await t.close();
   }
+});
+
+test('bindings 校验：配错配漏直接报错，不静默丢弃', () => {
+  const cfg = loadConfig({
+    __configFile: '/nonexistent.cc-bridge.json',
+    bindings: [
+      { chatId: 'oc_ok', cwd: '/repo/a' },
+      { chatId: '', cwd: '/repo/b' }, // chatId 空
+      { cwd: '/repo/c' }, // 整个缺 chatId
+      { chatId: 'ou_wrong', cwd: '/repo/d' }, // open_id 冒充群 chat_id
+      { chatId: 'oc_rel', cwd: 'relative/path' }, // cwd 非绝对路径
+      'junk', // 不是对象
+    ],
+  });
+  // 合法条目进入运行时绑定，其余每条都有对应错误
+  assert.deepEqual(cfg.bindings.map((b) => b.chatId), ['oc_ok']);
+  assert.equal(cfg.bindingErrors.length, 5);
+  const all = cfg.bindingErrors.join('\n');
+  assert.match(all, /chatId 未配置/);
+  assert.match(all, /oc_ 开头/);
+  assert.match(all, /绝对路径/);
+  assert.match(all, /不是对象/);
+
+  // validateServeConfig 把这些错误透出；serve/test 启动时直接失败
+  const errs = validateServeConfig(cfg);
+  assert.ok(errs.length >= 5);
+  // 一个 binding 都没配也是配置错误（无兜底接收方）
+  const empty = validateServeConfig(loadConfig({ __configFile: '/nonexistent.cc-bridge.json' }));
+  assert.ok(empty.some((e) => /bindings 未配置/.test(e)));
 });
 
 // ---------- 消息驱动 Claude Code（bindings：群 ↔ 目录） ----------
@@ -861,14 +977,14 @@ test('chatForCwd：绑定目录（含子目录）命中，最长前缀优先，�
   assert.equal(runner.chatForCwd(''), null);
 });
 
-test('卡片路由：确认卡按 cwd 发到绑定群，未命中走 peer 兜底', async () => {
+test('卡片路由：确认卡按 cwd 发到绑定群，未命中不发卡（无兜底）', async () => {
   const messenger = fakeMessenger();
   const chat = createChatRunner({ cfg: { ...CHAT_CFG }, messenger, client: fakeLarkClient() });
-  const bridge = createBridge({ cfg: { timeoutSec: 30, peer: 'oc_peer' }, messenger, chat });
+  const bridge = createBridge({ cfg: { timeoutSec: 30, bindings: CHAT_CFG.bindings }, messenger, chat });
   await new Promise((r) => bridge.server.listen(0, '127.0.0.1', r));
   const { port } = bridge.server.address();
   try {
-    // cwd 命中 /repo/a 绑定 → 确认卡发到 oc_chat1 群而非 peer
+    // cwd 命中 /repo/a 绑定 → 确认卡发到 oc_chat1 群
     const p = post(`http://127.0.0.1:${port}`, '/hook/permissionrequest', {
       ...PR_PAYLOAD,
       cwd: '/repo/a/sub',
@@ -877,18 +993,26 @@ test('卡片路由：确认卡按 cwd 发到绑定群，未命中走 peer 兜底
     await new Promise((r) => setTimeout(r, 150));
     assert.equal(messenger.sentTo.length, 1);
     assert.equal(messenger.sentTo[0].chatId, 'oc_chat1');
-    assert.equal(messenger.sent.length, 0);
     const rid = clickRid(messenger.sentTo[0].card, 'deny');
     await bridge.handleCardAction({ action: { value: { rid, act: 'deny' } }, operator: { open_id: 'ou_u' } });
     const j = JSON.parse(await (await p).text());
     assert.equal(j.hookSpecificOutput.decision.behavior, 'deny');
     assert.equal(messenger.updates.length, 1); // 点击后结果卡片照常更新
 
-    // cwd 未命中任何 binding → 通知卡走 peer
+    // cwd 未命中任何 binding → 不发卡，确认请求 fail-open 空响应回本地流程
+    const p2 = await post(`http://127.0.0.1:${port}`, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      cwd: '/elsewhere',
+      session_id: 'sess-route-2',
+    });
+    assert.equal((await p2.text()).trim(), '');
+    assert.equal(messenger.sentTo.length, 1);
+
+    // 未命中的通知事件同样不发卡
     await post(`http://127.0.0.1:${port}`, '/hook/notification', { message: 'm', cwd: '/elsewhere' });
     await new Promise((r) => setTimeout(r, 100));
-    assert.equal(messenger.sent.length, 1);
     assert.equal(messenger.sentTo.length, 1);
+    assert.equal(bridge.pendingSize(), 0);
   } finally {
     bridge.server.close();
   }
@@ -921,7 +1045,7 @@ test('health：包含消息驱动状态；__fromChat 的 stop 事件被抑制', 
     client: fakeLarkClient(),
     runClaude: async () => ({ ok: true, result: 'r' }),
   });
-  const bridge = createBridge({ cfg: { timeoutSec: 30, peer: 'oc_x' }, messenger, chat });
+  const bridge = createBridge({ cfg: { timeoutSec: 30 }, messenger, chat });
   await new Promise((r) => bridge.server.listen(0, '127.0.0.1', r));
   const { port } = bridge.server.address();
   try {

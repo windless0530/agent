@@ -40,7 +40,8 @@ const HELP = `cc-bridge — 把 Claude Code 的确认/授权请求转发到飞�
                                           确认事件；默认自动探测：新 CLI 用
                                           PermissionRequest（仅真正需要授权时触发），
                                           旧 CLI 回退 PreToolUse
-      [--with-stop]                       额外推送「任务完成」通知
+      （PostToolUse / Stop / Notification 一并安装：终端本地作答后把
+        飞书卡片刷成「已在终端处理」，任务完成通知默认关闭，见 notifyStop）
       [--url URL --token T]               远程模式：写入 curl 形式命令
       [--remove] [--dry-run]
   cc-bridge hook <event> [--url U] [--token T]   hook 进程入口（stdin/stdout 协议）
@@ -48,7 +49,7 @@ const HELP = `cc-bridge — 把 Claude Code 的确认/授权请求转发到飞�
   cc-bridge status                        查看 daemon 状态
   cc-bridge rules [--clear]               查看/清空免确认规则
 
-环境变量: CC_BRIDGE_APP_ID / CC_BRIDGE_APP_SECRET / CC_BRIDGE_PEER /
+环境变量: CC_BRIDGE_APP_ID / CC_BRIDGE_APP_SECRET /
           CC_BRIDGE_URL / CC_BRIDGE_TOKEN / CC_BRIDGE_CONFIG
 `;
 
@@ -56,7 +57,7 @@ const HELP = `cc-bridge — 把 Claude Code 的确认/授权请求转发到飞�
 
 function parseArgs(argv) {
   const flags = { _: [] };
-  const bool = new Set(['--force', '--global', '--with-stop', '--remove', '--dry-run', '--clear', '--help', '-h']);
+  const bool = new Set(['--force', '--global', '--remove', '--dry-run', '--clear', '--help', '-h']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') {
@@ -116,17 +117,25 @@ async function cmdServe(flags) {
   log('serve', `等待飞书确认超时: ${cfg.timeoutSec}s，并发上限: ${cfg.maxPending}`);
   if (chat) {
     for (const b of cfg.bindings) {
-      log('serve', `消息驱动绑定: 群 ${shortId(b.chatId)} ↔ ${b.cwd}${b.name ? `（${b.name}）` : ''}`);
+      log(
+        'serve',
+        `消息驱动绑定: 群 ${shortId(b.chatId)} ↔ ${b.cwd}` +
+          `${b.local === false ? '（仅路由：目录不在本机，消息不驱动执行）' : ''}` +
+          `${b.name ? `（${b.name}）` : ''}`,
+      );
     }
     log('serve', `消息驱动已开启: ${cfg.chatBin}，单条超时 ${cfg.chatTimeoutSec}s（绑定群消息免 @ 自动执行）`);
   }
 
   try {
-    await startEventStream(cfg, {
+    const ws = await startEventStream(cfg, {
       onCardAction: bridge.handleCardAction,
       onMessage: bridge.handleInboundMessage,
     });
     bridge.setWsState('connected');
+    if (typeof ws.getConnectionStatus === 'function') {
+      bridge.setWsStatusProvider(() => ws.getConnectionStatus());
+    }
   } catch (e) {
     log('serve', '飞书长连接建立失败:', e.message);
     log('serve', '请检查 appId/appSecret，以及飞书后台「事件与回调 → 订阅方式 → 长连接」');
@@ -187,7 +196,6 @@ async function cmdInstallHooks(flags) {
     cliPath: CLI_PATH,
     url: remote ? explicitUrl : undefined,
     token: flags.token || cfg.token,
-    withStop: flags.withStop,
     confirmEvent,
   });
   const r = installHooks({
@@ -221,14 +229,18 @@ async function cmdTest(flags) {
     process.exit(1);
   }
   const messenger = createMessenger(cfg);
-  const messageId = await messenger.sendCard(
-    buildNotifyCard({
-      title: '✅ cc-bridge 测试消息',
-      message: '配置生效！之后 Claude Code 的确认请求会以带按钮的卡片发到这里。',
-      severity: 'success',
-    }),
-  );
-  process.stdout.write(`测试卡片已发送（message_id: ${messageId}），请在飞书查看。\n`);
+  for (const b of cfg.bindings) {
+    const messageId = await messenger.sendCardTo(
+      b.chatId,
+      buildNotifyCard({
+        title: '✅ cc-bridge 测试消息',
+        message: `配置生效！绑定目录 \`${b.cwd}\` 的确认/通知卡片会发到本群。`,
+        cwd: b.cwd,
+        severity: 'success',
+      }),
+    );
+    process.stdout.write(`测试卡片已发送到群 ${shortId(b.chatId)}（message_id: ${messageId}），请在飞书查看。\n`);
+  }
 }
 
 async function cmdStatus(flags) {
@@ -269,10 +281,9 @@ async function cmdInit(flags) {
     overrides: {
       ...(flags.appId ? { appId: flags.appId } : {}),
       ...(flags.appSecret ? { appSecret: flags.appSecret } : {}),
-      ...(flags.peer ? { peer: flags.peer } : {}),
     },
   });
-  process.stdout.write(r.created ? `已生成配置模板: ${r.file}\n请填写 appId / appSecret / peer 后运行 cc-bridge serve。\n` : `配置已存在: ${r.file}\n`);
+  process.stdout.write(r.created ? `已生成配置模板: ${r.file}\n请填写 appId / appSecret，并在 bindings 里配置「群 chat_id ↔ 目录」后运行 cc-bridge serve。\n` : `配置已存在: ${r.file}\n`);
 }
 
 // ---------- main ----------

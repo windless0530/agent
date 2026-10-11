@@ -20,9 +20,10 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
    - 确认类 hook：**`PermissionRequest`**（新版 CLI，自动探测；恰好在 Claude Code 要弹权限确认框时触发，已被允许的操作不会重复打扰）或 **`PreToolUse`**（旧版 CLI 回退，每次工具调用都触发）。hook 进程把工具调用详情 POST 给 daemon 并**阻塞等待**；daemon 发一张带选项按钮的卡片到飞书，你点击后决策以 hook JSON 返回，Claude Code 据此放行或拒绝（拒绝原因会告知 Claude，它会调整方案）。
    - `Notification`（可选）：Claude 空闲等待输入等通知，转发为纯通知卡片。其中 `permission_prompt` 类通知（确认框闲置 ~6s 才触发）**在该会话已有挂起确认卡或刚被点击解决的 60s 内自动抑制**，避免与交互确认卡重复打扰；仅当 cc-bridge 未接管审批（发卡失败/并发超限回退本地确认）时才转发，作为手机端唯一提醒。
 2. 超时（默认 300s）未响应 → 返回空决策，交互式会话回退为本地正常确认流程（**fail-open**，bridge 挂掉也不影响 Claude Code 使用）。注意：headless 等无法弹框的会话中，Claude Code 对「无决策」本身会拒绝该工具调用——手机审批就是这类会话唯一的人工通道。
-3. **选项与终端确认框一一对应**：Claude Code 在 `permission_suggestions` 里给出确认框的选项建议，卡片按 cli.js 同款模板渲染为编号按钮（`1. Yes` / `2. Yes, and don't ask again for: <命令>` / `3. Yes, and switch to auto mode · auto mode handles these prompts for you` / `4. No`，个数与文案与终端一致）。点建议行 = 全部建议原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**；点 auto 行 = 回传 `setMode{auto, session}` 切换会话权限模式。终端上「switch to auto mode」选项本身不带建议条目（UI 自加），卡片据 `permission_mode`（default/acceptEdits 时提供）复原该选项。
+3. **终端本地作答联动**：Claude Code 不会因为你在终端本地回答了确认框而通知任何 hook（hook 进程与飞书卡片都会继续挂着），daemon 靠 `install-hooks` 一并安装的 `PostToolUse` / `Stop` 两个事件感知本地作答：同会话同工具同参数的工具确实执行了（PostToolUse，键序无关严格匹配，防并行同工具任务误伤）→ 卡片刷成「🖥️ 已在终端允许」；回合结束（Stop）→ 该会话剩余挂起卡片一律刷成「🖥️ 已在终端处理」（本地拒绝 / Esc 取消的兜底）。结算同时向仍挂起的 hook 连接回空体释放进程，卡片按钮随之失效。`Stop` 的「🏁 任务完成」通知默认关闭（`notifyStop: true` 打开）。
+4. **选项与终端确认框一一对应**：Claude Code 在 `permission_suggestions` 里给出确认框的选项建议，卡片按 cli.js 同款模板渲染为编号按钮（`1. Yes` / `2. Yes, and don't ask again for: <命令>` / `3. Yes, and switch to auto mode · auto mode handles these prompts for you` / `4. No`，个数与文案与终端一致）。点建议行 = 全部建议原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**；点 auto 行 = 回传 `setMode{auto, session}` 切换会话权限模式。终端上「switch to auto mode」选项本身不带建议条目（UI 自加），卡片据 `permission_mode`（default/acceptEdits 时提供）复原该选项。
    无 `permission_suggestions` 的确认框（如文件编辑类，不读该数组）或旧 CLI 回退为固定三键「✅ 允许 / 👍 总是允许（cc-bridge 内部规则，Bash 按首命令、文件工具按目录，daemon 重启清空）/ ❌ 拒绝」。
-4. **消息驱动 Claude Code**（`chatEnabled`，默认开）：在配置文件 `bindings` 里声明「群 ↔ 目录」绑定后，**绑定群里的文本消息免 @ 自动执行**，等价于在绑定目录的终端 `claude` cli 里输入（单聊不驱动执行）。daemon 收到消息后立刻回一张「🚀 处理中」回执卡，用 `claude -p --output-format json [--resume <sid>]` 无头执行（每个群保留各自上下文），跑完把回执卡更新为回复内容（含耗时/轮数/费用）。同一群串行执行（排队时回执显示「已排队」）。执行过程中的权限确认走上面的交互卡片，并按 `cwd` 路由回**该群**。发「**新会话**」（或 `/new`）丢弃上下文重来；未绑定的群 @机器人 会回复配置提示。这些消息驱动的会话不再收「任务完成」重复通知。
+5. **消息驱动 Claude Code**（`chatEnabled`，默认开）：在配置文件 `bindings` 里声明「群 ↔ 目录」绑定后，**绑定群里的文本消息免 @ 自动执行**，等价于在绑定目录的终端 `claude` cli 里输入（单聊不驱动执行）。daemon 收到消息后立刻回一张「🚀 处理中」回执卡，用 `claude -p --output-format json [--resume <sid>]` 无头执行（每个群保留各自上下文），跑完把回执卡更新为回复内容（含耗时/轮数/费用）。同一群串行执行（排队时回执显示「已排队」）。执行过程中的权限确认走上面的交互卡片，并按 `cwd` 路由回**该群**。发「**新会话**」（或 `/new`）丢弃上下文重来；未绑定的群 @机器人 会回复配置提示。这些消息驱动的会话不再收「任务完成」重复通知。
 
 ## 快速开始
 
@@ -52,7 +53,7 @@ node cli.mjs init          # 生成 ~/.cc-bridge.json
 node cli.mjs serve
 ```
 
-获取群的 `chat_id`：先把机器人拉进群，在群里发一条「**绑定**」，daemon 会把本群 `chat_id`（和你的 `open_id`）回复给你，填进 `bindings` 后重启 serve。不属于任何绑定目录的会话卡片发到 `peer`（兜底接收人，同样可用「绑定」获取，可为空）。
+获取群的 `chat_id`：先把机器人拉进群，在群里发一条「**绑定**」，daemon 会把本群 `chat_id`（和你的 `open_id`）回复给你，填进 `bindings` 后重启 serve。**没有兜底接收方**：未命中任何绑定目录的会话不发卡、不关联（确认请求直接 fail-open 回 Claude Code 本地确认）。每条 binding 必须同时配置 `chatId`（`oc_` 开头）和 `cwd`（绝对路径），配错配漏会在 serve/test 启动时报错退出。
 
 ### 3. 安装 hook 并验证
 
@@ -60,6 +61,7 @@ node cli.mjs serve
 node cli.mjs install-hooks           # 写入 ~/.claude/settings.json（全局）
 #   自动探测：CLI 支持 PermissionRequest 则用之，否则回退 PreToolUse
 #   --event permissionrequest|pretooluse 可手动指定
+#   PostToolUse / Stop / Notification 一并安装（本地作答联动 / 通知转发）
 node cli.mjs test                    # 发送测试卡片到飞书
 ```
 
@@ -75,33 +77,40 @@ node cli.mjs install-hooks --url http://<daemon-ip>:3757 --token <token>
 
 写入的是 `curl` 形式的 hook 命令，远程机器**不需要**安装 cc_bridge，有 curl 即可。
 
+远程机器 workspace 的确认卡要路由到**指定群**：在 daemon 的 `bindings` 里加上该机器的目录即可，如 `{ "chatId": "oc_..", "cwd": "/home/user/repo" }`——目录在 daemon 本机不存在也没关系，会作为**「仅路由」绑定**（确认卡照常按 cwd 前缀路由到该群；群消息不驱动执行，@机器人 会回复接入提示）。多台机器各绑各的群，互不串线。
+
+> ⚠️ **整个应用只能有一个 daemon 进程在跑**：飞书长连接对同一应用是负载均衡而非广播，多个 serve 并存时会互相抢事件（点击时丢时灵）。多机器场景一律「单 daemon + 远程 hook」，不要多处 serve 同一个 appId。
+
 ## 配置参考（~/.cc-bridge.json）
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `appId` / `appSecret` | — | 飞书应用凭据（appId 格式为 `cli_` + 16 位十六进制） |
-| `bindings` | `[]` | **「群 ↔ 目录」绑定列表**：`[{ "chatId": "oc_..", "cwd": "/repo/path", "name": "可选备注" }]`。绑定群消息免 @ 自动在该目录执行 claude；该目录（含子目录）下会话的确认/通知卡也路由到该群（多绑定目录重叠时最长前缀优先） |
-| `peer` | 空 | 兜底接收人：不属于任何绑定目录的会话卡片发这里，`open_id`（ou_）或群 `chat_id`（oc_） |
+| `bindings` | `[]` | **「群 ↔ 目录」绑定列表**：`[{ "chatId": "oc_..", "cwd": "/repo/path", "name": "可选备注" }]`。绑定群消息免 @ 自动在该目录执行 claude；该目录（含子目录）下会话的确认/通知卡也路由到该群（多绑定目录重叠时最长前缀优先）。**每条必须同时配置 `chatId`（`oc_` 开头）与 `cwd`（绝对路径），配错配漏 serve 启动直接报错**。cwd 不在 daemon 本机时自动成为「仅路由」绑定：卡片照常路由，消息不驱动执行（用于远程机器 workspace）。无兜底接收方：未命中任何绑定的目录不发卡 |
 | `host` / `port` | `127.0.0.1` / `3757` | HTTP 监听；跨机器接入改 `0.0.0.0` |
 | `timeoutSec` | `300` | 等待飞书确认的超时，上限 580（hook 侧显式配置 600s，保证 daemon 先超时） |
 | `maxPending` | `16` | 同时挂起的确认数上限，超出直接放行走本地流程 |
 | `token` | 空 | hook 客户端与 daemon 之间的 Bearer 共享密钥（跨机器必设） |
 | `allowedOpenIds` | `[]` | 允许点按钮/发指令的飞书用户，空为不限制（**开启消息驱动建议配置**，否则绑定群里的任何人都能在你机器上跑 claude） |
 | `allow` | `[]` | 预置免确认规则，如 `["Bash:git", "Edit:/src", "WebFetch"]` |
+| `notifyStop` | `false` | Stop 事件额外发「🏁 任务完成」通知卡（每回合一条，默认关；Stop hook 本身始终安装，用于终端本地作答联动） |
 | `domain` | `feishu` | `lark` 为国际版 |
+| `wsPingTimeoutSec` | `120` | 飞书长连接看门狗（秒）：ping 后该窗口内收不到任何入站帧即判定连接死亡并主动重连。半开连接不报 socket 错误，关掉它会出现「卡片照发、点击全丢」的假活状态 |
 | `chatEnabled` | `true` | 飞书消息驱动 Claude Code（按 `bindings` 绑定的群触发） |
 | `chatBin` | `claude` | claude 可执行文件 |
 | `chatModel` | 空 | 额外传给 claude 的 `--model`，空 = 用 claude 默认 |
 | `chatTimeoutSec` | `1800` | 单条消息的 claude 执行超时 |
 
-环境变量等价覆盖：`CC_BRIDGE_APP_ID` / `CC_BRIDGE_APP_SECRET` / `CC_BRIDGE_PEER` / `CC_BRIDGE_URL` / `CC_BRIDGE_TOKEN` / `CC_BRIDGE_CONFIG`。
+环境变量等价覆盖：`CC_BRIDGE_APP_ID` / `CC_BRIDGE_APP_SECRET` / `CC_BRIDGE_URL` / `CC_BRIDGE_TOKEN` / `CC_BRIDGE_CONFIG`。
 
 ## HTTP 接口
 
 | 方法 & 路径 | 说明 |
 |---|---|
 | `POST /hook/permissionrequest` `POST /hook/pretooluse` | 确认类 hook 的 stdin JSON → 挂起等待决策；响应体即 hook stdout（空 = 无意见），按事件返回对应决策 schema |
-| `POST /hook/notification` `POST /hook/stop` | 转通知卡片 |
+| `POST /hook/posttooluse` | 工具已执行 → 严格匹配（会话+工具+参数）结算对应挂起确认，卡片刷为「已在终端允许」；本身不挂起、不发卡 |
+| `POST /hook/notification` | 转通知卡片 |
+| `POST /hook/stop` | 回合结束 → 该会话挂起确认结算为「已在终端处理」；`notifyStop: true` 时另发「任务完成」卡 |
 | `POST /notify` | `{title, body, severity}` 手动推送卡片 |
 | `GET /health` | 状态（免鉴权） |
 | `GET/DELETE /rules` | 查看 / 清空免确认规则 |
@@ -149,6 +158,7 @@ WantedBy=default.target
 ## 设计说明
 
 - **fail-open**：daemon 未启动、网络断开、发卡失败、超时，一律返回空决策（exit 0、无 stdout），Claude Code 回退原生确认流程，永远不会因为 bridge 故障卡死。
+- **本地作答感知**：Claude Code 的 hook 体系没有「确认框已被本地回答」的事件，也不会杀掉仍在阻塞的 hook 进程，因此用 `PostToolUse`（工具确实执行 = 本地允许）与 `Stop`（回合结束 = 兜底）推断；卡片状态翻转走飞书官方「更新已发送的消息卡片」接口（`PATCH /im/v1/messages/:message_id`，前后卡片均声明 `update_multi: true`）。
 - **顺序与超时对齐**：hook 配置 `timeout: 600` > daemon `timeoutSec`（≤580），保证先由 daemon 超时返回、Claude Code 不会先杀 hook。
 - 决策 schema 按事件区分（均已对照官方 hooks 文档核实）：`PreToolUse` 返回 `hookSpecificOutput.permissionDecision`（allow/deny）；`PermissionRequest` 返回 `hookSpecificOutput.decision.behavior`（allow/deny），`deny` 的原因/消息会反馈给 Claude，建议行/auto 行通过 `decision.updatedPermissions`（数组）回传原生权限更新（addRules / setMode 等，字段见 hooks 文档「Permission update entries」）。
 - 挂起请求用 HTTP 长轮询实现，hook 进程无需额外状态；同一卡片重复回调按 rid 幂等处理。

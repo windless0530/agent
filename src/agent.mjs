@@ -101,7 +101,7 @@ export function createChatRunner({ cfg, messenger, client, runClaude = runClaude
   const seen = new Set(); // 已处理的 message_id（飞书可能重推）
   let botOpenIdPromise = null;
 
-  /** 卡片路由：按会话 cwd 找绑定的群（最长前缀优先），找不到返回 null（走 peer 兜底） */
+  /** 卡片路由：按会话 cwd 找绑定的群（最长前缀优先），找不到返回 null（无兜底，不发卡） */
   function chatForCwd(cwd) {
     if (!cwd) return null;
     const abs = path.resolve(cwd);
@@ -259,6 +259,25 @@ export function createChatRunner({ cfg, messenger, client, runClaude = runClaude
           )
           .catch(() => {});
         log('msg', `未绑定群 ${shortId(chatId)} @机器人，已回复配置提示`);
+      }
+      return;
+    }
+
+    // 「仅路由」绑定（目录不在 daemon 本机，通常对应远程机器的 workspace）：
+    // 确认卡照常路由到本群，但消息无法在本机驱动 claude 执行，@ 提示说明
+    if (binding.local === false) {
+      if (await isBotMentioned(msg.mentions)) {
+        await messenger
+          .replyText(
+            chatId,
+            [
+              `本群绑定的目录 \`${binding.cwd}\` 不在 daemon 本机，本群仅路由确认卡片，消息不驱动执行。`,
+              '远程机器接入方式：在其上执行 `node cli.mjs install-hooks --url http://<daemon>:3757 --token <token>`，',
+              '该机器 Claude Code 的确认请求会路由到本群；如需消息驱动执行，请把目录放到 daemon 本机再绑定。',
+            ].join('\n'),
+          )
+          .catch(() => {});
+        log('msg', `仅路由绑定群 ${shortId(chatId)} @机器人，已回复接入提示`);
       }
       return;
     }
