@@ -360,38 +360,70 @@ export function buildNotifyCard({ title, message, cwd, severity = 'info' }) {
 // ---------- 飞书消息驱动 Claude Code ----------
 
 /** 指令受理回执：先回这张，claude 跑完后 patch 成结果卡片 */
-export function buildChatAckCard({ prompt, queued = false }) {
+/** CLI 输入镜像卡：把用户在终端提交的 prompt 镜像到绑定群（UserPromptSubmit hook）。
+ *  title 取 herdr 的会话主题（terminal_title_stripped），herdr 不可用时退化为 sid。 */
+export function buildPromptMirrorCard({ prompt, title = '', sid = '', cwd = '' }) {
+  const sid8 = sid ? shortId(sid) : '';
+  const headerTitle = title
+    ? `⌨️ CLI 输入 · ${truncate(title, 40)}`
+    : sid8
+      ? `⌨️ CLI 输入 · ${sid8}`
+      : '⌨️ CLI 输入';
+  const lines = [];
+  if (prompt) lines.push(truncate(prompt, 1500));
+  if (cwd) lines.push(`**目录**：\`${truncate(cwd, 200)}\``);
   return {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: {
-        tag: 'plain_text',
-        content: queued ? '⏳ 已排队，等待上一条指令完成' : '🚀 Claude Code 处理中…',
-      },
+      title: { tag: 'plain_text', content: headerTitle },
+      template: 'blue',
+    },
+    body: {
+      elements: [
+        ...(lines.length ? [{ tag: 'markdown', content: lines.join('\n') }] : []),
+        note(`${now()} · ${hostname()}`),
+      ],
+    },
+  };
+}
+
+/** 任务受理回执卡：飞书注入 / 终端镜像 / 无头执行统一用这张（引用指令原文），
+ *  完成后 patch 成 buildTaskResultCard。name（injectAckName）非空时引用行带「回复 {name}：」 */
+export function buildTaskAckCard({ prompt, name = '', queued = false }) {
+  const quote = `${name ? `回复 ${name}：` : ''}${truncate(prompt, 400)}`;
+  const lines = [`<font color='grey'>💬 ${quote}</font>`];
+  if (queued) lines.push(`<font color='grey'>⏳ 已排队：目标会话当前有任务在跑</font>`);
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: queued ? '收到，已排队等待执行' : '收到，Claude Code 开始处理' },
       template: queued ? 'yellow' : 'blue',
     },
     body: {
       elements: [
-        { tag: 'markdown', content: truncate(prompt, 800) },
+        { tag: 'markdown', content: lines.join('\n') },
         note(`${now()} · 完成后本卡片更新为回复 · ${hostname()}`),
       ],
     },
   };
 }
 
-/** 指令结果卡片：把回执卡片 patch 成这个（成功/失败/超时） */
-export function buildChatResultCard({ ok, timedOut, result, error, sessionId, cwd, durationMs, costUsd, numTurns }) {
+/** 任务结果卡：完成时把回执卡 patch 成这张（无回执卡的 Stop 输出也用它）。
+ *  标题带指令原文（prompt），正文为最终输出；失败/超时为橙/黄变体。
+ *  三条路径（注入 / 镜像 / 无头）共用，保证完成提示长得一样 */
+export function buildTaskResultCard({ ok = true, timedOut = false, body = '', prompt = '', sessionId = '', cwd = '', durationMs, costUsd, numTurns } = {}) {
+  const head = prompt ? ` · ${truncate(prompt, 30)}` : '';
   const meta = timedOut
-    ? { title: '⏰ claude 超时', template: 'yellow' }
+    ? { title: `⏰ 超时${head}`, template: 'yellow' }
     : ok
-      ? { title: '🤖 claude 已回复', template: 'green' }
-      : { title: '⚠️ claude 未成功', template: 'orange' };
-  const body = timedOut ? error : ok ? result || '(无输出)' : result || error || '(无输出)';
+      ? { title: `🏁 已完成${head}`, template: 'green' }
+      : { title: `⚠️ 未成功${head}`, template: 'orange' };
   const stats = [
     sessionId ? `会话 \`${shortId(sessionId)}\`` : '',
     cwd ? `\`${truncate(cwd, 80)}\`` : '',
-    durationMs != null ? `${Math.round(Number(durationMs) / 1000)}s` : '',
+    durationMs != null && Number.isFinite(Number(durationMs)) ? `${Math.round(Number(durationMs) / 1000)}s` : '',
     numTurns != null ? `${numTurns} 轮` : '',
     Number(costUsd) > 0 ? `$${Number(costUsd).toFixed(4)}` : '',
   ]
@@ -407,7 +439,7 @@ export function buildChatResultCard({ ok, timedOut, result, error, sessionId, cw
     },
     body: {
       elements: [
-        { tag: 'markdown', content: truncate(body, 3800) },
+        { tag: 'markdown', content: truncate(body || '(无输出)', 3800) },
         note(`${now()}${stats ? ` · ${stats}` : ''}`),
       ],
     },

@@ -1,12 +1,16 @@
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { log, truncate, shortId } from './util.mjs';
-import { buildChatAckCard, buildChatResultCard } from './cards.mjs';
+import { buildTaskAckCard, buildTaskResultCard } from './cards.mjs';
+import { agentsForCwd, promptAgent } from './herdr.mjs';
+import { createBridgeState } from './state.mjs';
 
 /** 文本消息正文里的 @ 占位符（@_user_N），还原指令时要剥掉 */
 const MENTION_TOKEN = /@_user_\d+/g;
 /** 控制命令：丢弃当前会话，下一条消息从新会话开始 */
 const RESET_RE = /^(新会话|\/new|\/reset|reset|new)$/i;
+/** 注入寻址：#3 内容 → 定向注入 /sessions 列表里的 3 号会话 */
+const HASH_TARGET_RE = /^#(\d+)\s+(.+)$/;
 
 /** 解析文本消息正文：去 @ 占位符、压缩空白 */
 export function extractText(content) {
@@ -87,18 +91,34 @@ export function runClaudeOnce({ bin = 'claude', cwd, prompt, sessionId = '', mod
 
 /**
  * 飞书消息 → Claude Code 指令，按「群 ↔ 工作目录」绑定（配置文件 bindings 列表）：
- * 绑定群里的消息等价于在绑定目录的终端里输入 claude 指令（免 @，自动执行）；
+ * 绑定群里的消息等价于在该目录的终端输入 claude 指令（免 @，自动执行）；
  * 未绑定的群 @机器人 只回复配置提示；单聊不驱动执行。
- * 每个群串行执行、保留 claude 会话上下文（--resume）；
- * 受理即回「🚀 处理中」回执卡，跑完把同一张卡片更新为回复内容。
+ *
+ * 注入优先（chatInject，默认开）：绑定目录下有 herdr 管理的 claude 会话时，消息经
+ * `herdr agent prompt` 回合级注入该会话（busy 自动排队、blocked 拒绝注入）——群与终端
+ * 共享同一条会话线，受理回执卡串在用户消息下、Stop 时 patch 成统一结果卡。没有可用
+ * 会话才回退老行为：每群串行跑无头
+ * `claude -p [--resume]`。`#序号 内容` 定向、`/attach 序号` 固定、`/sessions` 列表。
+ * 防回环（state 共享给 hook 镜像侧）：镜像出去的本人消息 id 直接丢弃；注入的 prompt
+ * 不再镜像（本就来自群里）；同群同内容短窗高频触发断路器丢弃并告警一次。
  */
-export function createChatRunner({ cfg, messenger, client, runClaude = runClaudeOnce }) {
+export function createChatRunner({
+  cfg,
+  messenger,
+  client,
+  runClaude = runClaudeOnce,
+  state = null,
+  herdr = null,
+}) {
   const bindings = cfg.bindings || [];
   const byChat = new Map(bindings.map((b) => [b.chatId, b]));
   const bin = cfg.chatBin || 'claude';
-  const sessions = new Map(); // chatId -> claude session_id
+  const sessions = new Map(); // chatId -> claude session_id（无头回退线）
   const queues = new Map(); // chatId -> { chain, waiting }
+  const sticky = new Map(); // chatId -> { paneId, title }（/attach 固定的注入目标）
   const seen = new Set(); // 已处理的 message_id（飞书可能重推）
+  const st = state || createBridgeState();
+  const herd = herdr || { agentsForCwd, promptAgent };
   let botOpenIdPromise = null;
 
   /** 卡片路由：按会话 cwd 找绑定的群（最长前缀优先），找不到返回 null（无兜底，不发卡） */
@@ -179,7 +199,7 @@ export function createChatRunner({ cfg, messenger, client, runClaude = runClaude
   async function processPrompt(chatId, { cwd, messageId, prompt, position, ackId }) {
     // 排队中的消息开始执行：把回执从「已排队」刷成「处理中」
     if (ackId && position > 0) {
-      await messenger.updateCard(ackId, buildChatAckCard({ prompt })).catch(() => {});
+      await messenger.updateCard(ackId, buildTaskAckCard({ prompt })).catch(() => {});
     }
     const sessionId = sessions.get(chatId) || '';
     const startedAt = Date.now();
@@ -198,11 +218,11 @@ export function createChatRunner({ cfg, messenger, client, runClaude = runClaude
       r = { ok: false, error: `执行异常: ${e.message}` };
     }
     if (r.sessionId) sessions.set(chatId, r.sessionId);
-    const card = buildChatResultCard({
+    const card = buildTaskResultCard({
       ok: r.ok,
       timedOut: r.timedOut,
-      result: r.result,
-      error: r.error,
+      body: r.result || r.error || '',
+      prompt,
       sessionId: r.sessionId || sessionId,
       cwd,
       durationMs: r.durationMs ?? Date.now() - startedAt,
@@ -224,6 +244,111 @@ export function createChatRunner({ cfg, messenger, client, runClaude = runClaude
     );
   }
 
+  /** 注入模式状态图标 */
+  const statusIcon = (s) => (s === 'working' ? '◐' : s === 'blocked' ? '⛔' : '○');
+
+  /** 注入描述：会话主题（无则 sid/pane） */
+  const agentLabel = (a) =>
+    a.terminal_title_stripped || shortId(a.agent_session?.value || '') || a.pane_id || '?';
+
+  /**
+   * 注入路由：绑定目录下的 herdr 会话列表 → 目标解析（#N 定向 > /attach 固定 > 最近活跃）
+   * → `herdr agent prompt` 回合级注入。返回 true 表示消息已消化（含指令/报错回执），
+   * false 表示没有可用会话，调用方回退无头执行。
+   */
+  async function tryInject(chatId, binding, msg, prompt) {
+    const agents = await herd.agentsForCwd(binding.cwd);
+    if (!agents.length) return false;
+
+    // 会话管理指令（无论有无固定目标都可执行）
+    if (/^\/sessions$/i.test(prompt)) {
+      await messenger
+        .replyText(
+          chatId,
+          [
+            `\`${binding.cwd}\` 下的 herdr 会话：`,
+            ...agents.map(
+              (a, i) => `${i + 1}. ${statusIcon(a.agent_status)} ${truncate(agentLabel(a), 30)} · ${shortId(a.agent_session?.value || '')}`,
+            ),
+            '',
+            '发 `#序号 内容` 定向注入；`/attach 序号` 固定默认目标；`/detach` 解除固定。',
+            sticky.has(chatId)
+              ? `当前固定：${truncate(sticky.get(chatId).title || sticky.get(chatId).paneId, 30)}`
+              : '当前未固定（默认注入最近活跃的会话）。',
+          ].join('\n'),
+        )
+        .catch(() => {});
+      return true;
+    }
+    const attach = prompt.match(/^\/attach\s+(\d+)$/i);
+    if (attach) {
+      const a = agents[Number(attach[1]) - 1];
+      if (!a) {
+        await messenger.replyText(chatId, `没有编号 ${attach[1]} 的会话，发 /sessions 查看。`).catch(() => {});
+        return true;
+      }
+      sticky.set(chatId, { paneId: a.pane_id, title: agentLabel(a) });
+      await messenger
+        .replyText(chatId, `📌 已固定默认注入目标：${truncate(agentLabel(a), 30)}（${a.pane_id}），/detach 解除。`)
+        .catch(() => {});
+      return true;
+    }
+    if (/^\/detach$/i.test(prompt)) {
+      sticky.delete(chatId);
+      await messenger.replyText(chatId, '已解除固定，恢复默认（注入最近活跃的会话）。').catch(() => {});
+      return true;
+    }
+
+    // 目标解析与正文剥离
+    let target = null;
+    let body = prompt;
+    const hashMatch = prompt.match(HASH_TARGET_RE);
+    if (hashMatch) {
+      target = agents[Number(hashMatch[1]) - 1] || null;
+      body = hashMatch[2].trim();
+      if (!target) {
+        await messenger.replyText(chatId, `没有编号 ${hashMatch[1]} 的会话，发 /sessions 查看。`).catch(() => {});
+        return true;
+      }
+    } else {
+      const fixed = sticky.get(chatId);
+      target = (fixed && agents.find((a) => a.pane_id === fixed.paneId)) || agents[0];
+    }
+    if (!body) return true;
+
+    const sid = target.agent_session?.value || '';
+    const r = await herd.promptAgent(target.pane_id, body);
+    if (r.blocked) {
+      await messenger
+        .replyText(chatId, '⛔ 目标会话正在等待权限确认（先处理群里的确认卡），本条未注入，稍后重发。')
+        .catch(() => {});
+      log('inject', `blocked pane=${target.pane_id}，未注入`);
+      return true;
+    }
+    if (!r.ok) {
+      await messenger.replyText(chatId, `注入失败：${truncate(r.error, 200)}`).catch(() => {});
+      log('error', `注入失败 pane=${target.pane_id}:`, r.error);
+      return true;
+    }
+
+    // 成功：登记防环（此 prompt 不再镜像，额度由 hook 上报消费）+ 受理回执卡 +
+    // 来源消息进镜像队列（Stop 结果卡 patch 回执卡，标题带指令原文）
+    st.markInjection(sid, body);
+    const queued = target.agent_status === 'working';
+    let ackId = null;
+    try {
+      ackId = await messenger.replyCard(msg.message_id, buildTaskAckCard({ prompt: body, name: cfg.injectAckName, queued }));
+    } catch (e) {
+      log('error', '发送注入回执卡失败:', e.message);
+    }
+    st.enqueueMirror(sid, msg.message_id, body, ackId);
+    log(
+      'inject',
+      `chat=${shortId(chatId)} pane=${target.pane_id} sid=${shortId(sid)}: ${truncate(body, 100)}`,
+    );
+    return true;
+  }
+
   async function handleMessage(data) {
     // SDK 长连接派发时把 v2 事件的 event 体展平到顶层（message/sender 在 data 上），
     // 兼容带 event 包装的形状以防万一
@@ -231,6 +356,11 @@ export function createChatRunner({ cfg, messenger, client, runClaude = runClaude
     const msg = evt?.message || {};
     const chatId = msg.chat_id;
     if (!chatId || seenOnce(msg.message_id)) return;
+    // 防环第 1 层：本人身份镜像出去的消息会真实触发 receive 事件——直接丢弃
+    if (st.isMirroredMsg(msg.message_id)) {
+      log('loop', `丢弃镜像消息回环 message_id=${msg.message_id}`);
+      return;
+    }
     if (msg.chat_type !== 'group') return; // 只按群驱动；单聊不执行
     if (evt.sender?.sender_type && evt.sender.sender_type !== 'user') return; // 其它应用发的消息
     if (msg.message_type !== 'text') {
@@ -285,11 +415,35 @@ export function createChatRunner({ cfg, messenger, client, runClaude = runClaude
     const prompt = extractText(msg.content);
     if (!prompt) return;
 
+    // 防环第 3 层：断路器——同群同内容 60s 内高频重复，疑似回环，丢弃并告警一次
+    const breaker = st.noteInbound(chatId, prompt);
+    if (breaker.tripped) {
+      log('warn', `断路器跳闸 chat=${shortId(chatId)}：同内容 60s 内重复 ≥3 次，疑似回环，丢弃`);
+      if (breaker.first) {
+        await messenger
+          .replyText(chatId, '⚡ 疑似消息回环（同内容短时高频重复），已自动丢弃后续重复；确认终端与群双向链路正常后可重发。')
+          .catch(() => {});
+      }
+      return;
+    }
+
     if (RESET_RE.test(prompt)) {
       sessions.delete(chatId);
+      sticky.delete(chatId);
       log('chat', `已重置会话 chat=${shortId(chatId)}`);
-      await messenger.replyText(chatId, '🧹 已重置 Claude Code 会话，下一条消息将开启新会话。').catch(() => {});
+      await messenger
+        .replyText(
+          chatId,
+          '🧹 已重置：丢弃无头会话线与注入目标固定。注意：注入模式不新开会话，herdr 里的会话请在终端自行重启或 /new。',
+        )
+        .catch(() => {});
       return;
+    }
+
+    // 注入优先：目录下有 herdr 会话 → 直接注入该会话；没有才回退无头执行
+    if (cfg.chatInject !== false) {
+      const injected = await tryInject(chatId, binding, msg, prompt);
+      if (injected) return;
     }
 
     log('chat', `指令 chat=${shortId(chatId)} from=${shortId(senderId)} cwd=${binding.cwd}: ${truncate(prompt, 120)}`);
@@ -297,7 +451,7 @@ export function createChatRunner({ cfg, messenger, client, runClaude = runClaude
     // 受理即回执（不等排队），跑完把同一张卡片 patch 成结果
     let ackId = null;
     try {
-      ackId = await messenger.replyCard(msg.message_id, buildChatAckCard({ prompt, queued: position > 0 }));
+      ackId = await messenger.replyCard(msg.message_id, buildTaskAckCard({ prompt, queued: position > 0 }));
     } catch (e) {
       log('error', '发送回执卡片失败:', e.message);
     }

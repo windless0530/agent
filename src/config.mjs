@@ -30,6 +30,25 @@ export const DEFAULTS = {
   notifyStop: true,
   /** 飞书消息驱动 Claude Code 开关（按 bindings 绑定的群触发） */
   chatEnabled: true,
+  /** 受理回执卡的引用行称呼（如 "Elio"）：非空时回执卡引用行为「回复 Elio：<prompt>」，
+   *  卡片标题固定「收到，Claude Code 开始处理」。注入 / 终端镜像 / 无头三条路径共用 */
+  injectAckName: '',
+  /** 消息注入模式（默认开）：绑定目录下有 herdr 管理的 claude 会话时，群消息经
+   *  `herdr agent prompt` 注入该会话（群与终端共享同一条会话线），而非另起无头进程；
+   *  无可用会话自动回退无头执行。/sessions 列表、#序号 定向、/attach 固定 */
+  chatInject: true,
+  /** 是否把终端里提交的 prompt 镜像到绑定群（UserPromptSubmit hook → 镜像卡，
+   *  卡片标题带 herdr 会话主题；该会话的 Stop 输出卡会作为镜像卡的回复串成一串）。
+   *  仅同步展示，不影响本地执行；飞书消息驱动的会话不镜像（输入本就来自群里） */
+  mirrorPrompt: true,
+  /** 镜像是否优先以用户本人身份发文本消息（user_access_token；群里显示为用户自己发的）。
+   *  无凭据 / 刷新失败 / 发送失败自动降级为 bot 镜像卡。授权：node cli.mjs auth-url */
+  mirrorAsUser: true,
+  /** OAuth user_access_token 凭据落盘路径（与 config 分开存，chmod 600） */
+  authFile: '',
+  /** OAuth 授权回调地址（需先配到飞书开放平台应用的「安全设置 → 重定向 URL」；
+   *  本地 daemon 无公网回调，默认值仅作占位，用户从跳转后的地址栏复制 code） */
+  authRedirectUri: 'http://localhost:9999/callback',
   /** claude 可执行文件，默认 PATH 上的 claude */
   chatBin: 'claude',
   /** 额外传给 claude 的 --model，空 = 使用 claude 默认 */

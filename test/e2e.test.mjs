@@ -11,8 +11,8 @@ import {
   buildResultCard,
   buildNotifyCard,
   summarizeTool,
-  buildChatAckCard,
-  buildChatResultCard,
+  buildTaskAckCard,
+  buildTaskResultCard,
 } from '../src/cards.mjs';
 import { waitFor } from '../src/util.mjs';
 
@@ -23,6 +23,7 @@ function fakeMessenger() {
   const updates = [];
   const replies = [];
   const texts = [];
+  const userTexts = [];
   let n = 0;
   return {
     sent,
@@ -45,6 +46,11 @@ function fakeMessenger() {
     async replyText(chatId, text) {
       texts.push({ chatId, text });
     },
+    userTexts,
+    async sendTextAsUser(chatId, text, accessToken) {
+      userTexts.push({ chatId, text, accessToken });
+      return `umsg_${++n}`;
+    },
   };
 }
 
@@ -66,6 +72,22 @@ function fakeLarkClient({ botOpenId = 'ou_bot' } = {}) {
  * SDK 长连接会把 v2 事件的 event 体展平到顶层后调 handler（message/sender 在 data 上），
  * 默认按该真实形状构造；wrapped=true 时保留 event 包装（兼容路径）。
  */
+/** 假 herdr：默认无会话（消息回退无头执行），不依赖本机 herdr */
+function fakeHerdr(agents = []) {
+  return {
+    prompts: [],
+    async agentsForCwd(cwd) {
+      return agents.filter((a) => a.cwd === cwd || a.cwd.startsWith(cwd + '/'));
+    },
+    async promptAgent(paneId, text) {
+      this.prompts.push({ paneId, text });
+      const agent = agents.find((a) => a.pane_id === paneId) || null;
+      if (agent?.agent_status === 'blocked') return { ok: false, blocked: true, error: 'agent_blocked' };
+      return { ok: true, blocked: false, error: '', agent };
+    },
+  };
+}
+
 function msgEvent({
   chatType = 'p2p',
   chatId = 'oc_chat1',
@@ -106,7 +128,7 @@ async function startBridge(cfg = {}) {
   const messenger = fakeMessenger();
   const merged = { ...cfg, bindings: [...(cfg.bindings || []), DEFAULT_BINDING] };
   // 卡片路由依赖 chat runner 的 chatForCwd，必须一并挂上
-  const chat = createChatRunner({ cfg: merged, messenger, client: fakeLarkClient() });
+  const chat = createChatRunner({ herdr: fakeHerdr(), cfg: merged, messenger, client: fakeLarkClient() });
   const bridge = createBridge({ cfg: merged, messenger, chat });
   await new Promise((resolve) => bridge.server.listen(0, '127.0.0.1', resolve));
   const { port } = bridge.server.address();
@@ -847,7 +869,7 @@ const CHAT_CFG = {
 function newRunner({ cfg = {}, client = fakeLarkClient(), runClaude } = {}) {
   const messenger = fakeMessenger();
   const runs = [];
-  const runner = createChatRunner({
+  const runner = createChatRunner({ herdr: fakeHerdr(),
     cfg: { ...CHAT_CFG, ...cfg },
     messenger,
     client,
@@ -932,7 +954,7 @@ test('消息驱动：@占位符剥离；未绑定群 @机器人 → 配置提示
 test('消息驱动：新会话命令重置上下文；「绑定」命令回复信息；含「绑定」的正常指令不被劫持', async () => {
   const messenger = fakeMessenger();
   const runs = [];
-  const runner = createChatRunner({
+  const runner = createChatRunner({ herdr: fakeHerdr(),
     cfg: CHAT_CFG,
     messenger,
     client: fakeLarkClient(),
@@ -970,7 +992,7 @@ test('消息驱动：同一会话串行排队，busy 期间回执标记排队', 
   const order = [];
   let release;
   const gate = new Promise((r) => (release = r));
-  const runner = createChatRunner({
+  const runner = createChatRunner({ herdr: fakeHerdr(),
     cfg: CHAT_CFG,
     messenger,
     client: fakeLarkClient(),
@@ -1015,7 +1037,7 @@ test('消息驱动：白名单外用户 / 非文本 / 应用消息 / 重复推�
 
 test('消息驱动：runClaude 失败/超时 → 回执更新为失败/超时卡片', async () => {
   const messenger = fakeMessenger();
-  const runner = createChatRunner({
+  const runner = createChatRunner({ herdr: fakeHerdr(),
     cfg: CHAT_CFG,
     messenger,
     client: fakeLarkClient(),
@@ -1028,7 +1050,7 @@ test('消息驱动：runClaude 失败/超时 → 回执更新为失败/超时卡
   assert.match(card.header.title.content, /超时/);
   assert.match(card.body.elements[0].content, /超过 60s/);
 
-  const runner2 = createChatRunner({
+  const runner2 = createChatRunner({ herdr: fakeHerdr(),
     cfg: CHAT_CFG,
     messenger,
     client: fakeLarkClient(),
@@ -1060,7 +1082,7 @@ test('chatForCwd：绑定目录（含子目录）命中，最长前缀优先，�
 
 test('卡片路由：确认卡按 cwd 发到绑定群，未命中不发卡（无兜底）', async () => {
   const messenger = fakeMessenger();
-  const chat = createChatRunner({ cfg: { ...CHAT_CFG }, messenger, client: fakeLarkClient() });
+  const chat = createChatRunner({ herdr: fakeHerdr(), cfg: { ...CHAT_CFG }, messenger, client: fakeLarkClient() });
   const bridge = createBridge({ cfg: { timeoutSec: 30, bindings: CHAT_CFG.bindings }, messenger, chat });
   await new Promise((r) => bridge.server.listen(0, '127.0.0.1', r));
   const { port } = bridge.server.address();
@@ -1104,23 +1126,29 @@ test('卡片内容：回执/结果卡片与 extractText', () => {
   assert.equal(extractText('not-json'), '');
   assert.equal(extractText('{"text":"@_user_1"}'), '');
 
-  const ack = buildChatAckCard({ prompt: 'p', queued: true });
+  const ack = buildTaskAckCard({ prompt: 'p', name: 'Elio', queued: true });
   assert.equal(ack.header.template, 'yellow');
-  const ok = buildChatResultCard({
-    ok: true, result: '答案', sessionId: 'sess-abc12345', cwd: '/w',
+  assert.match(ack.body.elements[0].content, /回复 Elio：p/);
+  assert.match(ack.body.elements[0].content, /排队/);
+  const ack2 = buildTaskAckCard({ prompt: 'p2' });
+  assert.equal(ack2.header.template, 'blue');
+  assert.match(ack2.header.title.content, /收到，Claude Code 开始处理/);
+  const ok = buildTaskResultCard({
+    ok: true, body: '答案', prompt: '查状态', sessionId: 'sess-abc12345', cwd: '/w',
     durationMs: 1500, costUsd: 0.005, numTurns: 2,
   });
   assert.equal(ok.header.template, 'green');
+  assert.match(ok.header.title.content, /已完成 · 查状态/);
   assert.match(ok.body.elements[0].content, /答案/);
   assert.match(ok.body.elements.at(-1).content, /2s.*2 轮/);
-  const fail = buildChatResultCard({ ok: false, error: '崩了' });
+  const fail = buildTaskResultCard({ ok: false, body: '崩了' });
   assert.equal(fail.header.template, 'orange');
   assert.match(fail.body.elements[0].content, /崩了/);
 });
 
 test('health：包含消息驱动状态；__fromChat 的 stop 事件被抑制', async () => {
   const messenger = fakeMessenger();
-  const chat = createChatRunner({
+  const chat = createChatRunner({ herdr: fakeHerdr(),
     cfg: { ...CHAT_CFG },
     messenger,
     client: fakeLarkClient(),
@@ -1144,4 +1172,217 @@ test('health：包含消息驱动状态；__fromChat 的 stop 事件被抑制', 
   } finally {
     bridge.server.close();
   }
+});
+
+// ---------- 用户身份镜像（OAuth user_access_token） ----------
+
+import {
+  buildAuthorizeUrl,
+  exchangeCode,
+  getUserAccessToken,
+  AUTH_SCOPES,
+} from '../src/auth.mjs';
+
+test('auth：授权链接含 offline_access / send_as_user，参数齐全', () => {
+  const url = buildAuthorizeUrl({ appId: 'cli_x', redirectUri: 'http://localhost:9999/cb', state: 'st1' });
+  assert.ok(url.startsWith('https://accounts.feishu.cn/open-apis/authen/v1/authorize?'));
+  const params = new URL(url).searchParams;
+  assert.equal(params.get('client_id'), 'cli_x');
+  assert.equal(params.get('response_type'), 'code');
+  assert.equal(params.get('redirect_uri'), 'http://localhost:9999/cb');
+  assert.equal(params.get('state'), 'st1');
+  const scopes = params.get('scope').split(' ');
+  for (const s of AUTH_SCOPES) assert.ok(scopes.includes(s), `缺 scope ${s}`);
+});
+
+test('auth：exchangeCode 落盘 → getUserAccessToken 缓存命中不刷新；过期后单飞刷新且落盘新 refresh_token', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccbridge-auth-'));
+  const authFile = path.join(dir, 'auth.json');
+  const cfg = { appId: 'cli_x', appSecret: 'sec', domain: 'feishu', authFile };
+  let refreshCalls = 0;
+  const ok = (j) => ({ ok: true, status: 200, json: async () => j });
+  const fetchImpl = async (url, opts = {}) => {
+    const body = JSON.parse(opts.body || '{}');
+    if (url.includes('/authen/v2/oauth/token')) {
+      if (body.grant_type === 'authorization_code') {
+        return ok({ code: 0, access_token: 'u-at-1', expires_in: 3600, refresh_token: 'u-rt-1', refresh_token_expires_in: 604800, scope: 'offline_access im:message' });
+      }
+      refreshCalls++;
+      return ok({ code: 0, access_token: 'u-at-2', expires_in: 3600, refresh_token: 'u-rt-2', refresh_token_expires_in: 604800 });
+    }
+    if (url.includes('/authen/v1/user_info')) return ok({ code: 0, data: { open_id: 'ou_me', name: '测试者' } });
+    throw new Error('unexpected ' + url);
+  };
+
+  // 换码 → 落盘带用户身份
+  const saved = await exchangeCode({ cfg, code: 'c1', redirectUri: 'http://localhost:9999/cb', fetchImpl });
+  assert.equal(saved.open_id, 'ou_me');
+  assert.equal(saved.refresh_token, 'u-rt-1');
+
+  // 未过期：直接命中缓存，不刷新
+  const t1 = await getUserAccessToken(cfg, { fetchImpl });
+  assert.equal(t1.token, 'u-at-1');
+  assert.equal(refreshCalls, 0);
+
+  // 把 access 顶到过期线上：并发 3 次只发 1 次刷新（refresh_token 单次有效）
+  const stale = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+  stale.access_expires_at = Date.now() - 1000;
+  fs.writeFileSync(authFile, JSON.stringify(stale));
+  const [a, b, c] = await Promise.all([
+    getUserAccessToken(cfg, { fetchImpl }),
+    getUserAccessToken(cfg, { fetchImpl }),
+    getUserAccessToken(cfg, { fetchImpl }),
+  ]);
+  assert.equal(a.token, 'u-at-2');
+  assert.equal(b.token, 'u-at-2');
+  assert.equal(c.token, 'u-at-2');
+  assert.equal(refreshCalls, 1, '单飞：并发刷新只应请求一次');
+  const after = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+  assert.equal(after.refresh_token, 'u-rt-2', '刷新后的新 refresh_token 必须落盘');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身份文本，Stop 输出串在其下', async () => {
+  const prevHerdr = process.env.HERDR_BIN;
+  process.env.HERDR_BIN = '/nonexistent-herdr-bin'; // 测试环境不依赖真 herdr
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccbridge-mirror-'));
+  const bridges = []; // 失败路径也要关掉，否则 server 句柄挂住测试进程
+  try {
+    // A) 无凭据 → 降级 bot 镜像卡
+    const tA = await startBridge({ authFile: path.join(dir, 'none.json') });
+    bridges.push(tA.close);
+    await post(tA.base, '/hook/userpromptsubmit', { session_id: 'sess-mirror-a', cwd: DEFAULT_BINDING.cwd, prompt: '你好' });
+    await waitFor(() => tA.messenger.sentTo.length === 1);
+    assert.equal(tA.messenger.userTexts.length, 0);
+    assert.match(tA.messenger.sentTo[0].card.header.title.content, /CLI 输入/);
+    await waitFor(() => tA.messenger.updates.length === 1); // bot 镜像卡随即 patch 成受理回执卡
+    assert.match(tA.messenger.updates[0].card.header.title.content, /收到，Claude Code 开始处理/);
+    await tA.close();
+
+    // B) 凭据属白名单外用户 → 拒绝本人身份，降级 bot 卡
+    const fileB = path.join(dir, 'b.json');
+    fs.writeFileSync(fileB, JSON.stringify({ access_token: 'u-at-b', access_expires_at: Date.now() + 3600_000, refresh_token: 'rt-b', open_id: 'ou_someone_else' }));
+    const tB = await startBridge({ authFile: fileB, allowedOpenIds: ['ou_me'] });
+    bridges.push(tB.close);
+    await post(tB.base, '/hook/userpromptsubmit', { session_id: 'sess-mirror-b', cwd: DEFAULT_BINDING.cwd, prompt: '你好B' });
+    await waitFor(() => tB.messenger.sentTo.length === 1);
+    assert.equal(tB.messenger.userTexts.length, 0);
+    await tB.close();
+
+    // C) 有效凭据（白名单内）→ 以本人身份发文本；受理回执卡串在其下，Stop 结果 patch 回执卡
+    const fileC = path.join(dir, 'c.json');
+    fs.writeFileSync(fileC, JSON.stringify({ access_token: 'u-at-c', access_expires_at: Date.now() + 3600_000, refresh_token: 'rt-c', open_id: 'ou_me' }));
+    const tC = await startBridge({ authFile: fileC, allowedOpenIds: ['ou_me'], injectAckName: 'Elio' });
+    bridges.push(tC.close);
+    await post(tC.base, '/hook/userpromptsubmit', { session_id: 'sess-mirror-c', cwd: DEFAULT_BINDING.cwd, prompt: '你好C' });
+    await waitFor(() => tC.messenger.userTexts.length === 1);
+    assert.equal(tC.messenger.userTexts[0].chatId, DEFAULT_BINDING.chatId);
+    assert.equal(tC.messenger.userTexts[0].text, '你好C');
+    assert.equal(tC.messenger.sentTo.length, 0, '本人身份成功后不应再发 bot 卡');
+    await waitFor(() => tC.messenger.replies.length === 1);
+    assert.equal(tC.messenger.replies[0].messageId, 'umsg_1', '受理回执卡串在本人身份镜像消息下（fake 计数器从 1 起）');
+    assert.match(tC.messenger.replies[0].card.header.title.content, /收到，Claude Code 开始处理/);
+    assert.match(tC.messenger.replies[0].card.body.elements[0].content, /回复 Elio：你好C/);
+    await post(tC.base, '/hook/stop', { session_id: 'sess-mirror-c', cwd: DEFAULT_BINDING.cwd, transcript_path: '/nonexistent.jsonl' });
+    await waitFor(() => tC.messenger.updates.length === 1);
+    assert.equal(tC.messenger.updates[0].messageId, 'msg_2', 'Stop 结果应 patch 受理回执卡');
+    assert.match(tC.messenger.updates[0].card.header.title.content, /已完成 · 你好C/);
+  } finally {
+    if (prevHerdr === undefined) delete process.env.HERDR_BIN;
+    else process.env.HERDR_BIN = prevHerdr;
+    for (const close of bridges.splice(0)) await close().catch(() => {});
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- 注入模式（herdr agent prompt）与防回环 ----------
+
+import { createBridgeState } from '../src/state.mjs';
+
+function injectFixture(agents, extraCfg = {}) {
+  const herd = fakeHerdr(agents);
+  const messenger = fakeMessenger();
+  const runs = [];
+  const state = createBridgeState();
+  const runner = createChatRunner({
+    herdr: herd,
+    cfg: { ...CHAT_CFG, ...extraCfg },
+    messenger,
+    client: fakeLarkClient(),
+    runClaude: fakeRunClaude(runs, (a) => ({ ok: true, result: `echo:${a.prompt}`, sessionId: 's-headless' })),
+    state,
+  });
+  return { herd, messenger, runs, state, runner };
+}
+
+test('注入：默认注入最近活跃会话；#N 定向与排队提示；blocked 拒绝；/sessions 列表；无会话回退无头', async () => {
+  const agents = [
+    { agent: 'claude', pane_id: 'w1:p1', cwd: '/repo/a', agent_status: 'idle', agent_session: { value: 'sid-aaa' }, terminal_title_stripped: '任务A', state_change_seq: 10 },
+    { agent: 'claude', pane_id: 'w2:p1', cwd: '/repo/a', agent_status: 'working', agent_session: { value: 'sid-bbb' }, terminal_title_stripped: '任务B', state_change_seq: 20 },
+  ];
+  const { herd, messenger, runs, state, runner } = injectFixture(agents, { injectAckName: 'Elio' });
+
+  // 默认目标 = 列表第一位；注入成功 + 受理回执卡（引用指令原文）+ 防环登记
+  const ev1 = msgEvent({ chatType: 'group', text: '修复登录页', messageId: 'om_inj_1' });
+  await runner.handleMessage(ev1);
+  await waitFor(() => messenger.replies.length === 1);
+  assert.equal(herd.prompts.length, 1, '应注入而非无头执行');
+  assert.equal(herd.prompts[0].paneId, 'w1:p1');
+  assert.equal(herd.prompts[0].text, '修复登录页');
+  assert.equal(runs.length, 0);
+  assert.match(messenger.replies[0].card.header.title.content, /收到，Claude Code 开始处理/);
+  assert.match(messenger.replies[0].card.body.elements[0].content, /回复 Elio：修复登录页/);
+  assert.ok(state.isInjectedPrompt('sid-aaa', '修复登录页'), '注入的 prompt 不应再被镜像');
+  assert.ok(!state.isInjectedPrompt('sid-aaa', '修复登录页'), '注入额度已被 hook 上报消费，手输同内容应正常镜像');
+  const m1 = state.takeMirror('sid-aaa');
+  assert.equal(m1?.id, 'om_inj_1', '结果卡应串在用户消息下');
+  assert.equal(m1?.ackId, 'msg_1', 'Stop 结果应 patch 受理回执卡');
+  assert.equal(m1?.label, '修复登录页', '结果卡标题用指令原文');
+
+  // #2 定向 + working 排队提示（回执卡变体）
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '#2 优化搜索', messageId: 'om_inj_2' }));
+  await waitFor(() => messenger.replies.length === 2);
+  assert.equal(herd.prompts[1].paneId, 'w2:p1');
+  assert.equal(herd.prompts[1].text, '优化搜索');
+  assert.match(messenger.replies[1].card.header.title.content, /排队/);
+  assert.match(messenger.replies[1].card.body.elements[0].content, /回复 Elio：优化搜索/);
+
+  // blocked：目标会话卡在确认框 → 拒绝注入并提示（文本）
+  agents[0].agent_status = 'blocked';
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '再来一条', messageId: 'om_inj_3' }));
+  await waitFor(() => messenger.texts.length === 1);
+  assert.match(messenger.texts[0].text, /等待权限确认/);
+  agents[0].agent_status = 'idle';
+
+  // /sessions 列出会话
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '/sessions' }));
+  await waitFor(() => messenger.texts.length === 2);
+  assert.match(messenger.texts[1].text, /任务A[\s\S]*任务B/);
+
+  // 目录下没有 herdr 会话（oc_chat2 → /repo/b）→ 回退无头执行（受理回执卡同款）
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '普通任务', chatId: 'oc_chat2', messageId: 'om_fb_1' }));
+  await waitFor(() => runs.length === 1);
+  await waitFor(() => messenger.replies.length === 3);
+  assert.match(messenger.replies[2].card.header.title.content, /收到/);
+  assert.equal(herd.prompts.length, 3, '/sessions 不注入，blocked 已拒绝一条不新增');
+});
+
+test('注入防环：本人镜像消息直接丢弃；断路器同内容高频跳闸只放行前两条', async () => {
+  const agents = [
+    { agent: 'claude', pane_id: 'w1:p1', cwd: '/repo/a', agent_status: 'idle', agent_session: { value: 'sid-aaa' }, terminal_title_stripped: '任务A', state_change_seq: 10 },
+  ];
+  const { herd, messenger, state, runner } = injectFixture(agents);
+
+  // 第 1 层：镜像登记过的 message_id → 直接丢弃（不注入也不计数）
+  state.markMirroredMsg('om_mirror_1');
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '镜像回来的内容', messageId: 'om_mirror_1' }));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(herd.prompts.length, 0, '镜像回环消息应被丢弃');
+
+  // 第 3 层：同内容 3 次/60s → 前两次注入，第三次跳闸丢弃并告警
+  for (let i = 1; i <= 3; i++) {
+    await runner.handleMessage(msgEvent({ chatType: 'group', text: '重复任务', messageId: `om_rep_${i}` }));
+  }
+  await waitFor(() => messenger.texts.some((t) => /回环/.test(t.text)));
+  assert.equal(herd.prompts.length, 2, '断路器只放行前两条');
 });

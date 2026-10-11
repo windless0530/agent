@@ -71,6 +71,28 @@ export function createMessenger(cfg) {
         throw new Error(`回复消息失败 code=${resp.code} msg=${resp.msg}`);
       }
     },
+
+    /** 以用户本人身份发文本消息（user_access_token 鉴权，SDK 不托管该 token，裸调 OpenAPI）。
+     *  群里显示为用户自己发的消息；返回 message_id。 */
+    async sendTextAsUser(chatId, text, accessToken) {
+      const host = larkDomain(cfg.domain) === lark.Domain.Lark
+        ? 'https://open.larksuite.com'
+        : 'https://open.feishu.cn';
+      const res = await fetch(`${host}/open-apis/im/v1/messages?receive_id_type=chat_id`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j.code !== 0) {
+        throw new Error(`用户身份发送失败 http=${res.status} code=${j.code} ${j.msg || ''}`.trim());
+      }
+      return j.data?.message_id;
+    },
   };
 }
 

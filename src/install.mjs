@@ -37,7 +37,7 @@ export function buildHookCommands({ cliPath, url, token, confirmEvent = 'pretool
   const mk = (event, timeout) => {
     if (url) {
       const auth = token ? ` -H 'Authorization: Bearer ${token}'` : '';
-      return `curl -s --max-time 590 -H 'Content-Type: application/json'${auth} --data-binary @- ${url}/hook/${event}`;
+      return `curl -s --max-time ${Math.min(timeout, 590)} -H 'Content-Type: application/json'${auth} --data-binary @- ${url}/hook/${event}`;
     }
     return `"${process.execPath}" "${cliPath}" hook ${event}${token ? ` --token ${token}` : ''}`;
   };
@@ -47,6 +47,8 @@ export function buildHookCommands({ cliPath, url, token, confirmEvent = 'pretool
     PostToolUse: { event: 'posttooluse', timeout: 60 },
     Notification: { event: 'notification', timeout: 60 },
     Stop: { event: 'stop', timeout: 60 },
+    // prompt 镜像：daemon 立即放行，10s 兜底防 daemon 不可达时拖住终端
+    UserPromptSubmit: { event: 'userpromptsubmit', timeout: 10 },
   };
   const out = {};
   for (const [k, v] of Object.entries(cmds)) out[k] = { command: mk(v.event, v.timeout), timeout: v.timeout };
@@ -56,7 +58,7 @@ export function buildHookCommands({ cliPath, url, token, confirmEvent = 'pretool
 function isOurHookCommand(command) {
   return (
     /cc[-_]bridge/.test(command) ||
-    /\/hook\/(pretooluse|permissionrequest|posttooluse|notification|stop)/.test(command)
+    /\/hook\/(pretooluse|permissionrequest|posttooluse|notification|stop|userpromptsubmit)/.test(command)
   );
 }
 

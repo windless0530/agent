@@ -19,6 +19,14 @@ import {
 import { runHook } from './src/hook-client.mjs';
 import { createBridge } from './src/server.mjs';
 import { createChatRunner } from './src/agent.mjs';
+import {
+  buildAuthorizeUrl,
+  exchangeCode,
+  loadAuth,
+  randomState,
+  authFilePath,
+} from './src/auth.mjs';
+import { createBridgeState } from './src/state.mjs';
 // 飞书 SDK 按需加载：install-hooks / status 等客户端命令不依赖 node_modules，
 // client 机器接入远端 daemon 时无需 npm install
 import { buildNotifyCard } from './src/cards.mjs';
@@ -46,6 +54,12 @@ const HELP = `cc-bridge — 把 Claude Code 的确认/授权请求转发到飞�
       [--url URL --token T]               远程模式：写入 curl 形式命令
       [--remove] [--dry-run]
   cc-bridge hook <event> [--url U] [--token T]   hook 进程入口（stdin/stdout 协议）
+  cc-bridge auth-url [--redirect URI]     生成 OAuth 授权链接（终端 prompt 镜像为
+                                          「用户本人发的消息」所需；应用需先开通
+                                          im:message + im:message.send_as_user 权限）
+  cc-bridge auth <code> [--redirect URI]  用浏览器跳转后地址栏里的 code 换取并保存
+                                          user_access_token（~/.cc-bridge-auth.json）
+  cc-bridge auth-status                   查看已授权的用户身份与 token 有效期
   cc-bridge test                          健康检查 + 发送测试卡片
   cc-bridge status                        查看 daemon 状态
   cc-bridge rules [--clear]               查看/清空免确认规则
@@ -101,10 +115,12 @@ async function cmdServe(flags) {
 
   const { createMessenger, startEventStream } = await import('./src/feishu.mjs');
   const messenger = createMessenger(cfg);
+  // 共享桥接状态：镜像队列 + 防回环标记（chat 注入侧与 hook 镜像侧共用）
+  const state = createBridgeState();
   const chat = cfg.chatEnabled
-    ? createChatRunner({ cfg, messenger, client: messenger.client })
+    ? createChatRunner({ cfg, messenger, client: messenger.client, state })
     : null;
-  const bridge = createBridge({ cfg, messenger, chat });
+  const bridge = createBridge({ cfg, messenger, chat, bridgeState: state });
 
   try {
     await new Promise((resolve, reject) => {
@@ -258,6 +274,76 @@ async function cmdStatus(flags) {
   }
 }
 
+async function cmdAuthUrl(flags) {
+  const cfg = loadConfig(flags);
+  const redirect = flags.redirect || cfg.authRedirectUri;
+  const url = buildAuthorizeUrl({
+    appId: cfg.appId,
+    redirectUri: redirect,
+    state: randomState(),
+    domain: cfg.domain,
+  });
+  process.stdout.write(
+    [
+      'OAuth 授权链接（在已登录飞书的浏览器里打开，同意后跳转回调地址）：',
+      '',
+      url,
+      '',
+      '前置条件（飞书开发者后台 → 本应用）：',
+      '  1. 权限管理：开通 im:message 与 im:message.send_as_user，发布新版本生效',
+      `  2. 安全设置 → 重定向 URL：添加 ${redirect}`,
+      '',
+      '跳转后地址栏形如 ' + redirect + '?code=XXXX&state=... （code 5 分钟内有效、仅一次），',
+      '复制 code 参数运行: node cli.mjs auth <code>',
+    ].join('\n') + '\n',
+  );
+}
+
+async function cmdAuth(flags) {
+  const cfg = loadConfig(flags);
+  const code = flags._[0];
+  if (!code) {
+    process.stdout.write('用法: node cli.mjs auth <code>（code 见授权跳转后地址栏，5 分钟内有效）\n');
+    process.exitCode = 1;
+    return;
+  }
+  const redirect = flags.redirect || cfg.authRedirectUri;
+  const saved = await exchangeCode({ cfg, code, redirectUri: redirect });
+  process.stdout.write(
+    [
+      `✅ 已保存用户凭据: ${authFilePath(cfg)}`,
+      `身份: ${saved.name || '(未取到姓名)'} ${saved.open_id || '(未取到 open_id)'}`,
+      `access_token: ${new Date(saved.access_expires_at).toLocaleString()} 前有效`,
+      saved.refresh_token
+        ? `refresh_token: ${new Date(saved.refresh_expires_at).toLocaleString()} 前可刷新`
+        : '⚠️ 未拿到 refresh_token（授权 scope 缺 offline_access？），token 过期后需重新授权',
+      '',
+      'daemon 下次镜像时自动使用（无需重启）；镜像将以你本人的身份发到绑定群。',
+    ].join('\n') + '\n',
+  );
+}
+
+async function cmdAuthStatus(flags) {
+  const cfg = loadConfig(flags);
+  const auth = loadAuth(cfg);
+  if (!auth) {
+    process.stdout.write(`未授权（${authFilePath(cfg)} 不存在）。运行 node cli.mjs auth-url 开始授权。\n`);
+    return;
+  }
+  const accessLeft = Math.round(((auth.access_expires_at || 0) - Date.now()) / 60000);
+  const refreshLeft = Math.round(((auth.refresh_expires_at || 0) - Date.now()) / 60000);
+  process.stdout.write(
+    [
+      `身份: ${auth.name || '?'} ${auth.open_id || '?'}`,
+      `scope: ${auth.scope || '?'}`,
+      `access_token: ${accessLeft > 0 ? `剩余约 ${accessLeft} 分钟` : '已过期（daemon 会自动刷新）'}`,
+      auth.refresh_token
+        ? `refresh_token: ${refreshLeft > 0 ? `剩余约 ${Math.round(refreshLeft / 1440)} 天` : '已过期，需重新授权（node cli.mjs auth-url）'}`
+        : '无 refresh_token，token 过期即需重新授权',
+    ].join('\n') + '\n',
+  );
+}
+
 async function cmdRules(flags) {
   const cfg = loadConfig(flags);
   const base = serverUrl(cfg);
@@ -301,6 +387,9 @@ try {
     case 'init': await cmdInit(flags); break;
     case 'install-hooks': await cmdInstallHooks(flags); break;
     case 'test': await cmdTest(flags); break;
+    case 'auth-url': await cmdAuthUrl(flags); break;
+    case 'auth': await cmdAuth(flags); break;
+    case 'auth-status': await cmdAuthStatus(flags); break;
     case 'status': await cmdStatus(flags); break;
     case 'rules': await cmdRules(flags); break;
     default:

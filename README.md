@@ -23,7 +23,23 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
 3. **终端本地作答联动**：Claude Code 不会因为你在终端本地回答了确认框而通知任何 hook（hook 进程与飞书卡片都会继续挂着），daemon 靠 `install-hooks` 一并安装的 `PostToolUse` / `Stop` 两个事件感知本地作答：同会话同工具同参数的工具确实执行了（PostToolUse，键序无关严格匹配，防并行同工具任务误伤）→ 卡片刷成「🖥️ 已在终端允许」；回合结束（Stop）→ 该会话剩余挂起卡片一律刷成「🖥️ 已在终端处理」（本地拒绝 / Esc 取消的兜底）。结算同时向仍挂起的 hook 连接回空体释放进程，卡片按钮随之失效。`Stop` 还会推「🏁 已完成，等待输入」卡片，**内容即该回合的最终输出**（读 `transcript_path` 里最后一条 assistant 文本——飞书群里的最后一张卡不再是 "waiting for your input" 空话；远程机器路径读不到时退化为通用文案，`notifyStop: false` 关闭）。消息驱动会话的 Stop 不推（回复卡片已带结果）。
 4. **选项与终端确认框一一对应**：Claude Code 在 `permission_suggestions` 里给出确认框的选项建议，卡片按 cli.js 同款模板渲染为编号按钮（`1. Yes` / `2. Yes, and don't ask again for: <命令>` / …，个数与文案与终端一致）。飞书按钮无对齐属性、按渲染像素折行且居中（折行会把首行「Yes」顶偏），文本硬上限 100 字符，因此按钮文案按单行预算（Mac 端估 ~72-78 字符，取 70）**词边界截断加 `…`**；放不下的完整详情左对齐补在按钮上方的正文里，编号与按钮对应。点建议行 = 全部建议原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**；点 auto 行 = 回传 `setMode{auto, session}` 切换会话权限模式。终端上「switch to auto mode」选项本身不带建议条目（UI 自加），卡片据 `permission_mode`（default/acceptEdits 时提供）复原该选项。
    无 `permission_suggestions` 的确认框（如文件编辑类，不读该数组）或旧 CLI 回退为固定三键「✅ 允许 / 👍 总是允许（cc-bridge 内部规则，Bash 按首命令、文件工具按目录，daemon 重启清空）/ ❌ 拒绝」。
-5. **消息驱动 Claude Code**（`chatEnabled`，默认开）：在配置文件 `bindings` 里声明「群 ↔ 目录」绑定后，**绑定群里的文本消息免 @ 自动执行**，等价于在绑定目录的终端 `claude` cli 里输入（单聊不驱动执行）。daemon 收到消息后立刻回一张「🚀 处理中」回执卡，用 `claude -p --output-format json [--resume <sid>]` 无头执行（每个群保留各自上下文），跑完把回执卡更新为回复内容（含耗时/轮数/费用）。同一群串行执行（排队时回执显示「已排队」）。执行过程中的权限确认走上面的交互卡片，并按 `cwd` 路由回**该群**。发「**新会话**」（或 `/new`）丢弃上下文重来；未绑定的群 @机器人 会回复配置提示。这些消息驱动的会话不再收「任务完成」重复通知。
+5. **消息驱动 Claude Code**（`chatEnabled`，默认开）：在配置文件 `bindings` 里声明「群 ↔ 目录」绑定后，**绑定群里的文本消息免 @ 自动执行**，等价于在绑定目录的终端 `claude` cli 里输入（单聊不驱动执行）。按目录下是否已有运行中的会话分两种方式：
+   - **注入优先**（`chatInject`，默认开）：目录下有 herdr 管理的 claude 会话时，消息经 `herdr agent prompt` **回合级注入该会话**——群与终端共享同一条会话线（就是你终端里正在看的那个），会话 busy 自动排队、blocked（卡在确认框）拒绝注入并提示。**受理回执卡**「收到，Claude Code 开始处理」（引用行带 `injectAckName` 称呼与指令原文）串在你的消息下，完成后同一张卡 patch 成**统一结果卡**「🏁 已完成 · 指令原文」（正文为该回合最终输出）。多会话寻址：`/sessions` 列出目录下会话（状态 ◐ 执行中 / ⛔ 等确认 / ○ 空闲）、`#3 内容` 定向注入 3 号、`/attach 3` 固定默认目标、`/detach` 解除固定（默认注入最近活跃的）。
+   - **无头回退**：目录下没有 herdr 会话才另起 `claude -p --output-format json [--resume <sid>]` 无头执行（每个群保留各自上下文），受理回执卡同款（排队时黄色变体），跑完 patch 成同一张统一结果卡（附耗时/轮数/费用），同群串行排队。
+   执行过程中的权限确认走上面的交互卡片，并按 `cwd` 路由回**该群**。发「**新会话**」（或 `/new`）丢弃无头会话线与注入目标固定（注入模式不新开会话，重启请在终端操作）；未绑定的群 @机器人 会回复配置提示。这些消息驱动的会话不再收「任务完成」重复通知。
+6. **终端输入镜像**（`mirrorPrompt`，默认开）：`UserPromptSubmit` hook 把你在终端提交的 prompt 镜像到绑定目录对应的群，并优先**以用户本人身份发文本消息**（`user_access_token`，群里显示为你自己发的，见下方 OAuth 授权），紧随其后同样回一张受理回执卡；无凭据/刷新失败/发送失败自动降级为 bot 卡（发出后直接 patch 成同款受理回执卡，标题带 herdr 会话主题或 session_id 前 8 位）。该会话回合结束时受理卡 patch 成统一结果卡「🏁 已完成 · 指令原文」（排队连发多条 prompt 时按提交顺序逐条配对）。仅同步展示、不影响本地执行；镜像 hook 立即放行（10s 兜底），daemon 不可达也不拖住终端；消息驱动的会话不镜像（输入本就来自群里）。
+
+### 镜像为「用户本人」消息（OAuth 授权）
+
+bot 发的消息永远显示 bot 身份；要在群里显示为**你自己发的**，需授权一次 user_access_token：
+
+1. 飞书开发者后台 → 本应用 → **权限管理**：开通 `im:message` 与 `im:message.send_as_user`，**发布新版本**生效
+2. **安全设置 → 重定向 URL**：添加 `http://localhost:9999/callback`（默认回调地址，可用 `authRedirectUri` 覆盖；本地 daemon 无公网回调，授权后从浏览器地址栏复制 `code` 即可）
+3. `node cli.mjs auth-url` → 在已登录飞书的浏览器打开 → 同意授权
+4. 跳转后从地址栏复制 `code` 参数（5 分钟内有效）→ `node cli.mjs auth <code>`，凭据落盘 `~/.cc-bridge-auth.json`（chmod 600），daemon 无需重启即生效
+5. `node cli.mjs auth-status` 随时查看有效期
+
+token 自动刷新（`offline_access` scope 换取 refresh_token，单次有效、刷新即轮换、原子落盘；单飞防并发重复刷新）。飞书限制：用户授权 **365 天后必须重新授权**；refresh_token 过期/凭据属白名单外用户时镜像自动降级 bot 卡，不影响其他功能。
 
 ## 快速开始
 
@@ -100,9 +116,15 @@ daemon 机器把配置 `host` 改为 `0.0.0.0`（并设置 `token`）后 `./serv
 | `allowedOpenIds` | `[]` | 允许点按钮/发指令的飞书用户，空为不限制（**开启消息驱动建议配置**，否则绑定群里的任何人都能在你机器上跑 claude） |
 | `allow` | `[]` | 预置免确认规则，如 `["Bash:git", "Edit:/src", "WebFetch"]` |
 | `notifyStop` | `true` | Stop 事件推「🏁 已完成」卡，内容为该回合最终输出（读 transcript 最后一条 assistant 文本，读不到退化为通用文案）；发出后 10 分钟内抑制该会话的 idle_prompt 空闲提醒 |
+| `mirrorPrompt` | `true` | 把终端提交的 prompt 镜像到绑定群（详见工作原理第 6 条），不影响本地执行 |
+| `mirrorAsUser` | `true` | 镜像优先以用户本人身份发文本（user_access_token）；无凭据/失败降级 bot 卡。授权见「镜像为用户本人消息」小节 |
+| `authFile` | `~/.cc-bridge-auth.json` | OAuth 凭据落盘路径（chmod 600） |
+| `authRedirectUri` | `http://localhost:9999/callback` | OAuth 回调地址（需配到飞书应用「安全设置 → 重定向 URL」） |
 | `domain` | `feishu` | `lark` 为国际版 |
 | `wsPingTimeoutSec` | `120` | 飞书长连接看门狗（秒）：ping 后该窗口内收不到任何入站帧即判定连接死亡并主动重连。半开连接不报 socket 错误，关掉它会出现「卡片照发、点击全丢」的假活状态 |
 | `chatEnabled` | `true` | 飞书消息驱动 Claude Code（按 `bindings` 绑定的群触发） |
+| `chatInject` | `true` | 注入模式：目录下有 herdr 管理的 claude 会话时，群消息经 `herdr agent prompt` 注入该会话（共享会话线）而非另起无头进程；无可用会话自动回退无头执行。`/sessions` 列表、`#序号` 定向、`/attach` 固定 |
+| `injectAckName` | 空 | 受理回执卡引用行的称呼：非空时为「回复 {称呼}：\<prompt\>」，空则只引用指令原文（注入 / 终端镜像 / 无头三条路径共用） |
 | `chatBin` | `claude` | claude 可执行文件 |
 | `chatModel` | 空 | 额外传给 claude 的 `--model`，空 = 用 claude 默认 |
 | `chatTimeoutSec` | `1800` | 单条消息的 claude 执行超时 |
@@ -169,3 +191,4 @@ WantedBy=default.target
 - **顺序与超时对齐**：hook 配置 `timeout: 600` > daemon `timeoutSec`（≤580），保证先由 daemon 超时返回、Claude Code 不会先杀 hook。
 - 决策 schema 按事件区分（均已对照官方 hooks 文档核实）：`PreToolUse` 返回 `hookSpecificOutput.permissionDecision`（allow/deny）；`PermissionRequest` 返回 `hookSpecificOutput.decision.behavior`（allow/deny），`deny` 的原因/消息会反馈给 Claude，建议行/auto 行通过 `decision.updatedPermissions`（数组）回传原生权限更新（addRules / setMode 等，字段见 hooks 文档「Permission update entries」）。
 - 挂起请求用 HTTP 长轮询实现，hook 进程无需额外状态；同一卡片重复回调按 rid 幂等处理。
+- **双向防环（三层）**：镜像与注入打通后消息可能在「群 → CLI → 群 → CLI …」无限往返——① 以本人身份镜像出去的消息会真实触发 receive 事件，其 message_id 登记 30 分钟，入站命中直接丢弃；② daemon 注入会话的 prompt（sid+内容哈希，5 分钟）在 UserPromptSubmit 上报时命中则不再镜像；③ 断路器兜底：同群同内容 60s 内 ≥3 次即判定疑似回环，丢弃后续并告警一次。所有条目带 TTL 惰性清扫，无定时器。

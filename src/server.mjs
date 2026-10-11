@@ -11,7 +11,13 @@ import {
   buildConfirmCard,
   buildResultCard,
   buildNotifyCard,
+  buildPromptMirrorCard,
+  buildTaskAckCard,
+  buildTaskResultCard,
 } from './cards.mjs';
+import { findAgentBySession } from './herdr.mjs';
+import { getUserAccessToken } from './auth.mjs';
+import { createBridgeState } from './state.mjs';
 
 const PRETOOLUSE_ALLOW = {
   hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' },
@@ -93,10 +99,11 @@ function readBody(req, limit = 1024 * 1024) {
  * cc-bridge daemon 核心：HTTP 服务 + 挂起请求队列 + 免确认规则。
  * messenger 只需实现 sendCard(card)->messageId 与 updateCard(messageId, card)。
  */
-export function createBridge({ cfg, messenger, chat = null }) {
+export function createBridge({ cfg, messenger, chat = null, bridgeState = null }) {
   const pending = new Map(); // rid -> { res, messageId, meta, timer, settled }
   const recentResolved = new Map(); // session_id -> resolve 时间戳（抑制迟到的 permission_prompt 通知）
   const recentStop = new Map(); // session_id -> Stop 输出卡时间戳（抑制其后的 idle_prompt 空闲提醒）
+  const st = bridgeState || createBridgeState(); // 镜像队列 + 防回环（与 chat runner 共享）
   const allowRules = parseSeedRules(cfg.allow);
   const state = { ws: 'init', startedAt: Date.now(), wsStatusProvider: null };
 
@@ -343,27 +350,49 @@ export function createBridge({ cfg, messenger, chat = null }) {
         return sendJson(res, 200, '');
       }
       // 「任务完成」卡（notifyStop: false 关闭，默认开）：内容为该回合最终输出
-      // （读 transcript 最后一条 assistant 文本），读不到时退化为通用文案
+      // （读 transcript 最后一条 assistant 文本），读不到时退化为通用文案。
+      // 与注入/镜像/无头共用 buildTaskResultCard（标题带指令原文）：有受理回执卡
+      // 直接 patch 它（ack→result 一体）；无回执卡但有来源消息 → 串在其下；
+      // 都没有 → 独立发。排队连发多条 prompt 时按提交顺序逐条配对（取最旧）
       if (cfg.notifyStop !== false) {
         const output = lastAssistantText(payload.transcript_path);
         if (payload.session_id) recentStop.set(payload.session_id, Date.now());
+        const mirror = st.takeMirror(payload.session_id);
+        const card = buildTaskResultCard({
+          ok: true,
+          body: output || '回合结束，已在终端等待输入。',
+          prompt: mirror?.label || '',
+          sessionId: payload.session_id,
+          cwd: payload.cwd,
+        });
         try {
-          const messageId = await sendCardRouted(
-            payload.cwd,
-            buildNotifyCard({
-              title: '🏁 Claude Code 已完成，等待输入',
-              message: output || '回合结束，已在终端等待输入。',
-              cwd: payload.cwd,
-              severity: 'success',
-            }),
-          );
+          let messageId = null;
+          let via = '';
+          if (mirror?.ackId) {
+            try {
+              await messenger.updateCard(mirror.ackId, card);
+              messageId = mirror.ackId;
+              via = '（回执卡更新）';
+            } catch (e) {
+              log('error', `更新回执卡失败（${shortId(mirror.ackId)}），改串来源消息:`, e.message);
+            }
+          }
+          if (!messageId && mirror?.id) {
+            try {
+              messageId = await messenger.replyCard(mirror.id, card);
+              via = '（镜像回复）';
+            } catch (e) {
+              log('error', `回复镜像失败（${shortId(mirror.id)}），改发独立卡片:`, e.message);
+            }
+          }
+          if (!messageId) messageId = await sendCardRouted(payload.cwd, card);
           if (messageId) {
-            log('card', `Stop 输出卡 message_id=${messageId}${output ? '' : '（未读到 transcript，通用文案）'}`);
+            log('card', `Stop 结果卡 message_id=${messageId}${via}${output ? '' : '（未读到 transcript，通用文案）'}`);
           } else {
-            log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，跳过 Stop 输出卡`);
+            log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，跳过 Stop 结果卡`);
           }
         } catch (e) {
-          log('error', '发送 Stop 输出卡失败:', e.message);
+          log('error', '发送 Stop 结果卡失败:', e.message);
         }
       }
       return sendJson(res, 200, '');
@@ -411,6 +440,84 @@ export function createBridge({ cfg, messenger, chat = null }) {
       log('error', '发送通知卡片失败:', e.message);
     }
     sendJson(res, 200, '');
+  }
+
+  /** UserPromptSubmit：把终端提交的 prompt 镜像到绑定群。先立即放行 hook（不阻塞 CLI），
+   *  再异步发送。优先以用户本人身份发文本（user_access_token，群里显示为用户自己发的），
+   *  无凭据/刷新失败/发送失败一律降级 bot 镜像卡。镜像 message_id 进 per-session 队列，
+   *  Stop 输出卡按序作为其回复。飞书消息驱动的会话不镜像（输入本就来自群里）。 */
+  async function handlePromptMirror(req, res, payload) {
+    sendJson(res, 200, ''); // 先回空放行
+    try {
+      if (cfg.mirrorPrompt === false) return;
+      if (payload.__fromChat === 1) return;
+      const sid = payload.session_id || '';
+      const prompt = String(payload.prompt || '').trim();
+      if (!prompt) return;
+      // 防环第 2 层：该 prompt 是 daemon 从群里注入进来的 → 不镜像（镜像回去即回环）
+      if (st.isInjectedPrompt(sid, prompt)) {
+        log('loop', `抑制注入 prompt 的镜像（会话 ${shortId(sid)}）`);
+        return;
+      }
+      const target = chat?.chatForCwd(payload.cwd)?.chatId;
+      if (!target) {
+        log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，跳过 prompt 镜像`);
+        return;
+      }
+      // herdr 会话主题仅用于降级 bot 卡标题与日志归属（结果卡标题一律用指令原文，
+      // 会话主题在 prompt 提交时常还是上一条任务的，会拿错）
+      const agent = await findAgentBySession(sid);
+      const label = agent?.terminal_title_stripped || (sid ? shortId(sid) : '');
+
+      // 受理回执卡：与注入/无头路径同一张（引用指令原文），Stop 时 patch 成结果卡
+      const ackOf = async (sourceId) => {
+        try {
+          return await messenger.replyCard(sourceId, buildTaskAckCard({ prompt, name: cfg.injectAckName }));
+        } catch (e) {
+          log('error', '发送受理回执卡失败（Stop 将串在来源消息下）:', e.message);
+          return null;
+        }
+      };
+
+      // 1) 本人身份文本消息：token 属白名单外用户则拒绝（防凭据张冠李戴）
+      if (cfg.mirrorAsUser !== false) {
+        const tok = await getUserAccessToken(cfg);
+        if (tok?.token) {
+          if (cfg.allowedOpenIds?.length && tok.openId && !cfg.allowedOpenIds.includes(tok.openId)) {
+            log('warn', `user_access_token 属白名单外用户（${tok.openId}），拒绝本人身份镜像`);
+          } else {
+            try {
+              const messageId = await messenger.sendTextAsUser(target, prompt, tok.token);
+              if (messageId) {
+                // 防环第 1 层：本人身份消息会真实触发 receive 事件，登记 id 供入站丢弃
+                st.markMirroredMsg(messageId);
+                const ackId = await ackOf(messageId);
+                st.enqueueMirror(sid, messageId, prompt, ackId);
+                log('card', `镜像消息(本人) message_id=${messageId}${label ? `（${truncate(label, 30)}）` : ''}`);
+                return;
+              }
+            } catch (e) {
+              // 发送明确失败才降级；极小概率「已发出但响应丢失」会重复一条，可接受
+              log('error', '本人身份镜像发送失败，降级 bot 卡片:', e.message);
+            }
+          }
+        }
+      }
+
+      // 2) 降级：bot 镜像卡发出后直接 patch 成受理回执卡（同一张卡承担「镜像 + 受理」）
+      const messageId = await messenger.sendCardTo(target, buildPromptMirrorCard({ prompt, title: label, sid, cwd: payload.cwd }));
+      let ackId = null;
+      try {
+        await messenger.updateCard(messageId, buildTaskAckCard({ prompt, name: cfg.injectAckName }));
+        ackId = messageId;
+      } catch (e) {
+        log('error', '镜像卡 patch 回执失败（Stop 将串在该卡下）:', e.message);
+      }
+      st.enqueueMirror(sid, messageId, prompt, ackId);
+      log('card', `镜像卡 message_id=${messageId}${label ? `（${truncate(label, 30)}）` : ''}`);
+    } catch (e) {
+      log('error', '发送 prompt 镜像失败:', e.message);
+    }
   }
 
   async function handleNotify(req, res, payload) {
@@ -565,6 +672,9 @@ export function createBridge({ cfg, messenger, chat = null }) {
           const n = settleLocalFromPostToolUse(payload);
           if (n) log('resolve', `PostToolUse：${payload.tool_name} 已在终端允许，结算挂起确认`);
           return sendJson(res, 200, '');
+        }
+        if (event === 'userpromptsubmit') {
+          return await handlePromptMirror(req, res, payload);
         }
         if (['notification', 'stop', 'sessionstart'].includes(event)) {
           return await handleAlertEvent(req, res, payload, event);
