@@ -237,13 +237,18 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
     return matches.length;
   }
 
-  /** 从会话 transcript（JSONL）取最后一条 assistant 文本消息，即该回合的最终输出。
-   *  Stop 触发时 transcript 已写完整回合；从后向前找，跳过纯 tool_use / 坏行。
-   *  远程机器的本地路径读不到时返回空（退化为通用文案）。 */
-  function lastAssistantText(transcriptPath) {
+  /** 从会话 transcript（JSONL）取「本回合」最后一条 assistant 文本，即该回合的最终输出。
+   *  从后向前找，跳过纯 tool_use / thinking / 坏行，回溯到本回合的发起 user 消息为止——
+   *  不越界，否则无文本的回合会把上一轮的旧输出捞出来冒充本轮结果。
+   *  远程机器的本地路径读不到时返回空串。 */
+  function finalTurnText(transcriptPath) {
     if (!transcriptPath || typeof transcriptPath !== 'string') return '';
     try {
       const lines = fs.readFileSync(transcriptPath, 'utf8').trimEnd().split('\n');
+      const isToolResult = (e) => {
+        const blocks = e?.message?.content;
+        return Array.isArray(blocks) && blocks.some((b) => b?.type === 'tool_result');
+      };
       for (let i = lines.length - 1; i >= 0; i--) {
         let entry;
         try {
@@ -251,6 +256,8 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
         } catch {
           continue; // 半行 / 坏行
         }
+        // 本回合发起消息（非 tool_result 的 user 条目）之前已是上一回合，停止回溯
+        if (entry?.type === 'user' && !isToolResult(entry)) break;
         if (entry?.type !== 'assistant') continue;
         const blocks = entry.message?.content;
         const texts = Array.isArray(blocks)
@@ -264,6 +271,16 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
       // 路径不存在（远程机器）/ 无权限 → 空串
     }
     return '';
+  }
+
+  /** Stop 触发时 transcript 末行可能尚未落盘（hook 与写盘并发）：文件在但首次读不到
+   *  最终文本时隔 300ms 重读一次；文件本就不存在（远程机器）则不重试。 */
+  async function finalTurnTextWithRetry(transcriptPath) {
+    const first = finalTurnText(transcriptPath);
+    if (first) return first;
+    if (!transcriptPath || typeof transcriptPath !== 'string' || !fs.existsSync(transcriptPath)) return '';
+    await new Promise((r) => setTimeout(r, 300));
+    return finalTurnText(transcriptPath);
   }
 
 
@@ -349,18 +366,43 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
       if (payload.__fromChat === 1) {
         return sendJson(res, 200, '');
       }
-      // 「任务完成」卡（notifyStop: false 关闭，默认开）：内容为该回合最终输出
-      // （读 transcript 最后一条 assistant 文本），读不到时退化为通用文案。
-      // 与注入/镜像/无头共用 buildTaskResultCard（标题带指令原文）：有受理回执卡
+      // 「任务完成」卡（notifyStop: false 关闭，默认开）：只在读得到 transcript 且能取到
+      // 本回合最终 assistant 文本时才发——「🏁 已完成」必须带着真实最终输出，读不到
+      // （远程机器路径 / 末行未落盘）时不新发任何卡，避免任务还在中途就冒出空泛的
+      // 「已完成，等待输入」。已存在的受理回执卡不能永远停在「开始处理」：读不到输出
+      // 时把它 patch 成灰色「回合已结束」终态（不新增卡片、不误称已完成）。
+      // 有输出时与注入/镜像/无头共用 buildTaskResultCard（标题带指令原文）：有受理回执卡
       // 直接 patch 它（ack→result 一体）；无回执卡但有来源消息 → 串在其下；
       // 都没有 → 独立发。排队连发多条 prompt 时按提交顺序逐条配对（取最旧）
       if (cfg.notifyStop !== false) {
-        const output = lastAssistantText(payload.transcript_path);
-        if (payload.session_id) recentStop.set(payload.session_id, Date.now());
+        const output = await finalTurnTextWithRetry(payload.transcript_path);
         const mirror = st.takeMirror(payload.session_id);
+        if (!output) {
+          log('notify', `Stop 未读到本回合最终文本（会话 ${shortId(payload.session_id || '')}），跳过结果卡`);
+          if (mirror?.ackId) {
+            try {
+              await messenger.updateCard(
+                mirror.ackId,
+                buildTaskResultCard({
+                  ok: true,
+                  muted: true,
+                  body: '',
+                  prompt: mirror.label || '',
+                  sessionId: payload.session_id,
+                  cwd: payload.cwd,
+                }),
+              );
+              if (payload.session_id) recentStop.set(payload.session_id, Date.now());
+              log('card', `Stop 回执卡置为「回合已结束」 message_id=${mirror.ackId}`);
+            } catch (e) {
+              log('error', '更新回执卡失败:', e.message);
+            }
+          }
+          return sendJson(res, 200, '');
+        }
         const card = buildTaskResultCard({
           ok: true,
-          body: output || '回合结束，已在终端等待输入。',
+          body: output,
           prompt: mirror?.label || '',
           sessionId: payload.session_id,
           cwd: payload.cwd,
@@ -387,7 +429,8 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null }
           }
           if (!messageId) messageId = await sendCardRouted(payload.cwd, card);
           if (messageId) {
-            log('card', `Stop 结果卡 message_id=${messageId}${via}${output ? '' : '（未读到 transcript，通用文案）'}`);
+            if (payload.session_id) recentStop.set(payload.session_id, Date.now());
+            log('card', `Stop 结果卡 message_id=${messageId}${via}`);
           } else {
             log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，跳过 Stop 结果卡`);
           }

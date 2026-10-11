@@ -411,15 +411,18 @@ export function buildTaskAckCard({ prompt, name = '', queued = false }) {
 }
 
 /** 任务结果卡：完成时把回执卡 patch 成这张（无回执卡的 Stop 输出也用它）。
- *  标题带指令原文（prompt），正文为最终输出；失败/超时为橙/黄变体。
- *  三条路径（注入 / 镜像 / 无头）共用，保证完成提示长得一样 */
-export function buildTaskResultCard({ ok = true, timedOut = false, body = '', prompt = '', sessionId = '', cwd = '', durationMs, costUsd, numTurns } = {}) {
+ *  标题带指令原文（prompt），正文为最终输出；失败/超时为橙/黄变体；muted 为灰色的
+ *  「回合已结束」——Stop 读不到本回合最终文本时收尾用（回执卡不能永远停在「开始处理」，
+ *  但也不冒充「已完成」）。三条路径（注入 / 镜像 / 无头）共用，保证完成提示长得一样 */
+export function buildTaskResultCard({ ok = true, timedOut = false, muted = false, body = '', prompt = '', sessionId = '', cwd = '', durationMs, costUsd, numTurns } = {}) {
   const head = prompt ? ` · ${truncate(prompt, 30)}` : '';
   const meta = timedOut
     ? { title: `⏰ 超时${head}`, template: 'yellow' }
-    : ok
-      ? { title: `🏁 已完成${head}`, template: 'green' }
-      : { title: `⚠️ 未成功${head}`, template: 'orange' };
+    : muted
+      ? { title: `◌ 回合已结束${head}`, template: 'grey' }
+      : ok
+        ? { title: `🏁 已完成${head}`, template: 'green' }
+        : { title: `⚠️ 未成功${head}`, template: 'orange' };
   const stats = [
     sessionId ? `会话 \`${shortId(sessionId)}\`` : '',
     cwd ? `\`${truncate(cwd, 80)}\`` : '',
@@ -439,7 +442,13 @@ export function buildTaskResultCard({ ok = true, timedOut = false, body = '', pr
     },
     body: {
       elements: [
-        { tag: 'markdown', content: truncate(body || '(无输出)', 3800) },
+        {
+          tag: 'markdown',
+          content: truncate(
+            body || (muted ? '本回合已结束，未读到最终输出（transcript 不可读或尚未落盘），详见终端。' : '(无输出)'),
+            3800,
+          ),
+        },
         note(`${now()}${stats ? ` · ${stats}` : ''}`),
       ],
     },
