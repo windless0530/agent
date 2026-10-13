@@ -121,6 +121,8 @@ async function cmdServe(flags) {
     ? createChatRunner({ cfg, messenger, client: messenger.client, state })
     : null;
   const bridge = createBridge({ cfg, messenger, chat, bridgeState: state });
+  // blocked 注入提示按确认卡死活分流（还挂着→点卡；已超时翻灰→只能回终端），探针只能事后回填
+  if (chat?.setPendingProbe) chat.setPendingProbe((sid) => bridge.hasPendingFor(sid));
 
   try {
     await new Promise((resolve, reject) => {

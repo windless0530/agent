@@ -12,7 +12,6 @@ import {
   buildResultCard,
   buildNotifyCard,
   summarizeTool,
-  buildTaskAckCard,
   buildTaskResultCard,
 } from '../src/cards.mjs';
 import { waitFor } from '../src/util.mjs';
@@ -23,6 +22,7 @@ function fakeMessenger() {
   const sentTo = [];
   const updates = [];
   const replies = [];
+  const reactions = [];
   const texts = [];
   const userTexts = [];
   let n = 0;
@@ -31,6 +31,7 @@ function fakeMessenger() {
     sentTo,
     updates,
     replies,
+    reactions,
     texts,
     async sendCardTo(chatId, card) {
       sent.push(card);
@@ -43,6 +44,10 @@ function fakeMessenger() {
     async replyCard(messageId, card) {
       replies.push({ messageId, card });
       return `msg_${++n}`;
+    },
+    async addReaction(messageId, emojiType) {
+      reactions.push({ messageId, emojiType });
+      return `react_${++n}`;
     },
     async replyText(chatId, text) {
       texts.push({ chatId, text });
@@ -74,9 +79,12 @@ function fakeLarkClient({ botOpenId = 'ou_bot' } = {}) {
  * 默认按该真实形状构造；wrapped=true 时保留 event 包装（兼容路径）。
  */
 /** 假 herdr：默认无会话（消息回退无头执行），不依赖本机 herdr */
-function fakeHerdr(agents = []) {
+function fakeHerdr(agents = [], panes = []) {
   return {
     prompts: [],
+    keys: [],
+    starts: [],
+    panes,
     async agentsForCwd(cwd) {
       return agents.filter((a) => a.cwd === cwd || a.cwd.startsWith(cwd + '/'));
     },
@@ -85,6 +93,28 @@ function fakeHerdr(agents = []) {
       const agent = agents.find((a) => a.pane_id === paneId) || null;
       if (agent?.agent_status === 'blocked') return { ok: false, blocked: true, error: 'agent_blocked' };
       return { ok: true, blocked: false, error: '', agent };
+    },
+    async sendKeys(paneId, key) {
+      this.keys.push({ paneId, key });
+      return true;
+    },
+    async listPanes() {
+      return this.panes;
+    },
+    async startAgentInPane(paneId, { name = '', args = [] } = {}) {
+      this.starts.push({ paneId, name, args });
+      // 拉起成功：死 pane 复活为 claude（与真实 herdr 行为一致）
+      const pane = this.panes.find((p) => p.pane_id === paneId);
+      if (pane) {
+        pane.agent = 'claude';
+        pane.agent_status = 'idle';
+        pane.agent_session = { value: 'sid-restarted' };
+      }
+      return {
+        ok: true,
+        error: '',
+        agent: { pane_id: paneId, agent_status: 'idle', agent_session: { value: 'sid-restarted' } },
+      };
     },
   };
 }
@@ -125,13 +155,21 @@ function fakeRunClaude(runs, resultOf) {
 /** 默认绑定：BASH_PAYLOAD / PR_PAYLOAD 的 cwd 都在 /home/user/project 下 */
 const DEFAULT_BINDING = { chatId: 'oc_t', cwd: '/home/user/project' };
 
-async function startBridge(cfg = {}, paneReader = async () => '') {
+async function startBridge(cfg = {}, paneReader = async () => '', seams = {}) {
   const messenger = fakeMessenger();
   const merged = { ...cfg, bindings: [...(cfg.bindings || []), DEFAULT_BINDING] };
   // 卡片路由依赖 chat runner 的 chatForCwd，必须一并挂上；paneReader 默认读不到
   // （非 herdr 会话），保证权限类测试不依赖本机真实终端
   const chat = createChatRunner({ herdr: fakeHerdr(), cfg: merged, messenger, client: fakeLarkClient() });
-  const bridge = createBridge({ cfg: merged, messenger, chat, paneReader });
+  const bridge = createBridge({
+    cfg: merged,
+    messenger,
+    chat,
+    paneReader,
+    paneResolver: seams.paneResolver || null,
+    keySender: seams.keySender || null,
+  });
+  chat.setPendingProbe((sid) => bridge.hasPendingFor(sid)); // 与 cli.mjs serve 同款回填
   await new Promise((resolve) => bridge.server.listen(0, '127.0.0.1', resolve));
   const { port } = bridge.server.address();
   return { bridge, messenger, base: `http://127.0.0.1:${port}`, async close() { bridge.server.close(); } };
@@ -406,18 +444,19 @@ test('notification / stop / notify 事件：按 binding 路由发卡；未命中
 });
 
 test('Stop 输出卡：读得到本回合最终 assistant 文本才发；回合边界不越界；其后 idle_prompt 抑制', async () => {
-  // 构造 transcript：上一回合的旧文本在前；本回合末尾是纯 tool_use 行与坏行，都应被跳过
+  // 构造 transcript：上一回合的旧文本在前；本回合含 tool_use 结尾的中间文本（steering
+  // 插话回应形态）、纯 tool_use 行与坏行，都应被跳过，只认 end_turn 收尾文本
   const transcript = path.join(os.tmpdir(), `cc-bridge-stop-${process.pid}-${Date.now()}.jsonl`);
   fs.writeFileSync(
     transcript,
     [
       JSON.stringify({ type: 'user', message: { content: '上一轮问题' } }),
-      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '上一轮的旧输出' }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '上一轮的旧输出' }], stop_reason: 'end_turn' } }),
       JSON.stringify({ type: 'user', message: { content: '跑一下' } }),
-      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '中间步骤输出' }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '中间步骤输出' }], stop_reason: 'tool_use' } }),
       JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } }),
-      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash' }] } }),
-      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '完成。现在的规则：xxx' }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash' }], stop_reason: 'tool_use' } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '完成。现在的规则：xxx' }], stop_reason: 'end_turn' } }),
       '{broken json',
     ].join('\n') + '\n',
   );
@@ -447,14 +486,14 @@ test('Stop 输出卡：读得到本回合最终 assistant 文本才发；回合�
     assert.equal((await idle.text()).trim(), '');
     assert.equal(t.messenger.sent.length, 1);
 
-    // 本回合没有最终文本（末尾只有 tool_use）：不越界捞上一轮旧文本，直接不发卡
+    // 本回合没有最终文本（末尾只有 tool_use，无 end_turn 收尾）：不越界捞上一轮旧文本，直接不发卡
     fs.writeFileSync(
       transcript,
       [
         JSON.stringify({ type: 'user', message: { content: '上一轮问题' } }),
-        JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '上一轮的旧输出' }] } }),
+        JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '上一轮的旧输出' }], stop_reason: 'end_turn' } }),
         JSON.stringify({ type: 'user', message: { content: '跑一下' } }),
-        JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash' }] } }),
+        JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash' }], stop_reason: 'tool_use' } }),
       ].join('\n') + '\n',
     );
     await post(t.base, '/hook/stop', { session_id: 'sess-stop-2', cwd: '/home/user/project', transcript_path: transcript });
@@ -470,6 +509,54 @@ test('Stop 输出卡：读得到本回合最终 assistant 文本才发；回合�
     });
     await new Promise((r) => setTimeout(r, 100));
     assert.equal(t.messenger.sent.length, 2);
+  } finally {
+    fs.unlinkSync(transcript);
+    await t.close();
+  }
+});
+
+test('Stop 结果卡：中间输出（tool_use 结尾）不冒充结果；末条延迟落盘时重读补上', async () => {
+  // 复现真实事故：steering 插话的回应（有文本、stop_reason=tool_use）已落盘，Stop hook
+  // 抢在回合收尾文本（end_turn）落盘前触发——半截 transcript 落在中间输出上
+  const transcript = path.join(os.tmpdir(), `cc-bridge-stop-steer-${process.pid}-${Date.now()}.jsonl`);
+  const midTurnOnly = [
+    JSON.stringify({ type: 'user', message: { content: '任务执行中……' } }),
+    JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: '注入已收到。——这是中间输出' }], stop_reason: 'tool_use' },
+    }),
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } }),
+  ].join('\n') + '\n';
+  const finalLine = JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'text', text: '自测完成，机制全部验证通过。' }], stop_reason: 'end_turn' },
+  }) + '\n';
+  const t = await startBridge({ timeoutSec: 30 });
+  try {
+    // 1) hook 先触发（文件里只有中间输出），收尾文本 100ms 后才落盘 → 空读重试拿到真结果
+    fs.writeFileSync(transcript, midTurnOnly);
+    const p = post(t.base, '/hook/stop', {
+      session_id: 'sess-steer-1',
+      cwd: '/home/user/project',
+      transcript_path: transcript,
+    });
+    await new Promise((r) => setTimeout(r, 100)); // 收尾文本在重试窗口内落盘
+    fs.appendFileSync(transcript, finalLine);
+    await p;
+    assert.equal(t.messenger.sent.length, 1);
+    assert.match(t.messenger.sent[0].header.title.content, /已完成/);
+    assert.equal(t.messenger.sent[0].header.template, 'green');
+    assert.match(t.messenger.sent[0].body.elements[0].content, /自测完成，机制全部验证通过/);
+    assert.doesNotMatch(t.messenger.sent[0].body.elements[0].content, /注入已收到/);
+
+    // 2) 始终只有中间输出（回合被压缩/中断、无收尾文本）：不得把中间输出冒充结果发卡
+    fs.writeFileSync(transcript, midTurnOnly);
+    await post(t.base, '/hook/stop', {
+      session_id: 'sess-steer-2',
+      cwd: '/home/user/project',
+      transcript_path: transcript,
+    });
+    assert.equal(t.messenger.sent.length, 1, '无 end_turn 收尾文本 → 不发结果卡');
   } finally {
     fs.unlinkSync(transcript);
     await t.close();
@@ -808,6 +895,226 @@ test('PermissionRequest：建议合并行按建议内容选 cli.js 模板；垃�
   }
 });
 
+// ---------- 终端确认框代答（dialog 模式：hook 立即放行，点卡读屏发键） ----------
+
+/** 单条 Bash addRules 建议对应的终端确认框（与卡片选项逐字一致） */
+const DIALOG_3OPT = ` Bash command
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: rm -rf node_modules
+   3. No
+
+ Esc to cancel · Tab to amend`;
+
+/** 选项变了（比如另一条命令的两项框）——与卡片不一致，不得代答 */
+const DIALOG_CHANGED = ` Edit file
+ This file requires approval
+
+ Do you want to make this edit?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend`;
+
+test('代答模式：pane 会话 hook 立即放行（卡无寿命），点建议行 → Down+Enter 代答后翻绿', async () => {
+  const reads = [DIALOG_3OPT, DIALOG_3OPT, '']; // 发卡读屏（autoRow）→ 点卡验框 → 复验
+  const keys = [];
+  const t = await startBridge({ timeoutSec: 30 }, async () => reads.shift() ?? '', {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => (keys.push({ paneId, key }), true),
+  });
+  try {
+    const res = await post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      permission_suggestions: PR_PAYLOAD.permission_suggestions.slice(0, 1),
+    });
+    assert.equal((await res.text()).trim(), ''); // hook 立即空体放行，不等按钮
+    assert.equal(t.messenger.sent.length, 1);
+    const card = t.messenger.sent[0];
+    assert.match(card.body.elements.at(-1).content, /无超时/); // 代答卡脚注
+    assert.equal(t.bridge.pendingSize(), 1);
+
+    // 点建议行（第 2 项）→ Down+Enter 代答，复验框消失 → 翻绿
+    await t.bridge.handleCardAction({
+      action: { value: { rid: clickRid(card, 'suggest'), act: 'suggest' } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(keys, [{ paneId: 'w9:p1', key: 'Down' }, { paneId: 'w9:p1', key: 'Enter' }]);
+    assert.equal(t.messenger.updates[0].card.header.template, 'green');
+    assert.match(t.messenger.updates[0].card.header.title.content, /已允许并记住规则/);
+    assert.equal(t.bridge.pendingSize(), 0);
+  } finally {
+    await t.close();
+  }
+});
+
+test('代答模式：拒绝 → Esc；无建议三键卡的允许 → 直接 Enter；点卡时框已不在 → 已在终端处理', async () => {
+  // 1) deny → Escape（无建议卡发卡时不读屏，读全部发生在点卡后）
+  let reads = [DIALOG_3OPT, '']; // 点卡验框 → 复验
+  const keys = [];
+  let t = await startBridge({ timeoutSec: 30 }, async () => reads.shift() ?? '', {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => (keys.push({ paneId, key }), true),
+  });
+  try {
+    const res = await post(t.base, '/hook/permissionrequest', { ...PR_PAYLOAD, permission_suggestions: undefined });
+    assert.equal((await res.text()).trim(), '');
+    const card = t.messenger.sent[0];
+    await t.bridge.handleCardAction({
+      action: { value: { rid: clickRid(card, 'deny'), act: 'deny' } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(keys, [{ paneId: 'w9:p1', key: 'Escape' }]);
+    assert.equal(t.messenger.updates[0].card.header.template, 'grey');
+    assert.match(t.messenger.updates[0].card.header.title.content, /已拒绝/);
+  } finally {
+    await t.close();
+  }
+
+  // 2) 无建议卡 allow → 纯 Yes 行，直接 Enter（无 Down）
+  reads = [DIALOG_3OPT, ''];
+  keys.length = 0;
+  t = await startBridge({ timeoutSec: 30 }, async () => reads.shift() ?? '', {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => (keys.push({ paneId, key }), true),
+  });
+  try {
+    await post(t.base, '/hook/permissionrequest', { ...PR_PAYLOAD, session_id: 'sess-dlg-2', permission_suggestions: undefined });
+    const card = t.messenger.sent[0];
+    await t.bridge.handleCardAction({
+      action: { value: { rid: clickRid(card, 'allow'), act: 'allow' } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(keys, [{ paneId: 'w9:p1', key: 'Enter' }]);
+    assert.match(t.messenger.updates[0].card.header.title.content, /已允许/);
+  } finally {
+    await t.close();
+  }
+
+  // 3) 点卡时框已不在（本地已答）→ 不发键，翻「已在终端处理」
+  reads = [''];
+  keys.length = 0;
+  t = await startBridge({ timeoutSec: 30 }, async () => reads.shift() ?? '', {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => (keys.push({ paneId, key }), true),
+  });
+  try {
+    await post(t.base, '/hook/permissionrequest', { ...PR_PAYLOAD, session_id: 'sess-dlg-3', permission_suggestions: undefined });
+    const card = t.messenger.sent[0];
+    await t.bridge.handleCardAction({
+      action: { value: { rid: clickRid(card, 'allow'), act: 'allow' } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(keys, [], '框不在就不发任何键');
+    assert.match(t.messenger.updates[0].card.header.title.content, /已在终端处理/);
+  } finally {
+    await t.close();
+  }
+});
+
+test('代答模式：终端选项与卡片不一致 / 复验框仍在 → 不硬按，翻「确认框已变化」', async () => {
+  // 1) 点卡时框换成了别的确认（选项对不上）
+  let reads = ['', DIALOG_CHANGED];
+  const keys = [];
+  let t = await startBridge({ timeoutSec: 30 }, async () => reads.shift() ?? '', {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => (keys.push({ paneId, key }), true),
+  });
+  try {
+    await post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      session_id: 'sess-dlg-4',
+      permission_suggestions: PR_PAYLOAD.permission_suggestions.slice(0, 1),
+    });
+    const card = t.messenger.sent[0];
+    await t.bridge.handleCardAction({
+      action: { value: { rid: clickRid(card, 'suggest'), act: 'suggest' } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(keys, [], '选项对不上不发键');
+    assert.match(t.messenger.updates[0].card.header.title.content, /确认框已变化/);
+    assert.equal(t.messenger.updates[0].card.header.template, 'grey');
+  } finally {
+    await t.close();
+  }
+
+  // 2) 键发出去了但框一直在（复验两拍仍见框）→ 不硬猜结果
+  reads = ['', DIALOG_3OPT, DIALOG_3OPT, DIALOG_3OPT];
+  keys.length = 0;
+  t = await startBridge({ timeoutSec: 30 }, async () => reads.shift() ?? '', {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => (keys.push({ paneId, key }), true),
+  });
+  try {
+    await post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      session_id: 'sess-dlg-5',
+      permission_suggestions: PR_PAYLOAD.permission_suggestions.slice(0, 1),
+    });
+    const card = t.messenger.sent[0];
+    await t.bridge.handleCardAction({
+      action: { value: { rid: clickRid(card, 'allow'), act: 'allow' } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(keys.map((k) => k.key), ['Enter'], '发了键但复验不通过');
+    assert.match(t.messenger.updates[0].card.header.title.content, /确认框已变化/);
+  } finally {
+    await t.close();
+  }
+});
+
+test('代答模式：PostToolUse 本地结算照常翻卡；新确认到达时旧代答卡被清扫', async () => {
+  const keys = [];
+  const t = await startBridge({ timeoutSec: 30 }, async () => '', {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => (keys.push({ paneId, key }), true),
+  });
+  try {
+    // 1) 代答挂起期间工具在本地跑了（用户终端先答）→ local-allow，无 res 也不崩
+    await post(t.base, '/hook/permissionrequest', { ...PR_PAYLOAD, session_id: 'sess-sw', permission_suggestions: undefined });
+    assert.equal(t.bridge.pendingSize(), 1);
+    await post(t.base, '/hook/posttooluse', {
+      tool_name: PR_PAYLOAD.tool_name,
+      tool_input: PR_PAYLOAD.tool_input,
+      session_id: 'sess-sw',
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.match(t.messenger.updates[0].card.header.title.content, /已在终端允许/);
+    assert.equal(t.bridge.pendingSize(), 0);
+    assert.deepEqual(keys, []);
+
+    // 2) 本地 Esc 拒绝过的旧卡（无 PTU/Stop 信号可依）：同会话新确认到达 → 读屏无框 → 清扫翻灰
+    await post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      session_id: 'sess-sw',
+      tool_input: { command: 'npm test', description: 'x' },
+      permission_suggestions: undefined,
+    });
+    assert.equal(t.messenger.sent.length, 2);
+    await post(t.base, '/hook/permissionrequest', {
+      ...PR_PAYLOAD,
+      session_id: 'sess-sw',
+      tool_input: { command: 'ls', description: 'y' },
+      permission_suggestions: undefined,
+    });
+    assert.equal(t.messenger.sent.length, 3);
+    await waitFor(() => t.messenger.updates.length === 2);
+    assert.match(t.messenger.updates[1].card.header.title.content, /已在终端处理/);
+    assert.equal(t.bridge.pendingSize(), 1); // 只剩最新一张
+    assert.deepEqual(keys, []);
+  } finally {
+    await t.close();
+  }
+});
+
 test('PermissionRequest：兼容旧卡片 act=always → 回传第一条 addRules 建议 + 内部规则兜底', async () => {
   const t = await startBridge({ timeoutSec: 30 });
   try {
@@ -989,17 +1296,17 @@ function newRunner({ cfg = {}, client = fakeLarkClient(), runClaude } = {}) {
 test('消息驱动：绑定群消息免 @ 执行（在绑定目录跑 claude）；单聊忽略；会话延续', async () => {
   const { runner, messenger, runs } = newRunner();
   await runner.handleMessage(msgEvent({ chatType: 'group', text: ' 查看git状态 ' }));
-  await waitFor(() => messenger.replies.length === 2);
+  await waitFor(() => messenger.replies.length === 1);
   assert.equal(runs.length, 1);
   assert.equal(runs[0].prompt, '查看git状态'); // 压缩空白
   assert.equal(runs[0].cwd, '/repo/a'); // 在绑定目录执行
   assert.equal(runs[0].sessionId, ''); // 首条无会话
   assert.equal(runs[0].env.CC_BRIDGE_FROM_CHAT, '1');
-  // 回执卡先发（蓝色「已开始」），跑完另发结果卡片（绿色含回复），回执不再改动
-  assert.equal(messenger.replies[0].card.header.template, 'blue');
-  assert.match(messenger.replies[0].card.header.title.content, /已开始/);
-  assert.equal(messenger.replies[1].card.header.template, 'green');
-  assert.match(messenger.replies[1].card.body.elements[0].content, /echo:查看git状态/);
+  // 受理 = 来源消息上的 Get 表态（不发回执卡）；跑完另发结果卡片（绿色含回复）
+  assert.equal(messenger.reactions.length, 1);
+  assert.equal(messenger.reactions[0].emojiType, 'Get');
+  assert.equal(messenger.replies[0].card.header.template, 'green');
+  assert.match(messenger.replies[0].card.body.elements[0].content, /echo:查看git状态/);
 
   // 第二条消息带上一条的 session_id（上下文延续）
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '继续' }));
@@ -1089,7 +1396,7 @@ test('消息驱动：新会话命令重置上下文；「绑定」命令回复�
   assert.equal(runs[2].prompt, '帮我绑定一个 webhook');
 });
 
-test('消息驱动：同一会话串行排队，busy 期间回执标记排队', async () => {
+test('消息驱动：同一会话串行排队，受理 Get 表态即时、结果按序另发新卡', async () => {
   const messenger = fakeMessenger();
   const order = [];
   let release;
@@ -1109,18 +1416,22 @@ test('消息驱动：同一会话串行排队，busy 期间回执标记排队', 
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '二', messageId: 'om_2' }));
   await new Promise((r) => setTimeout(r, 100));
   assert.deepEqual(order, ['start:一']); // 二在排队
-  assert.equal(messenger.replies.length, 2); // 两条回执都已发出
-  assert.equal(messenger.replies[1].card.header.template, 'yellow'); // 排队态
+  // 受理表态不等排队，两条都已加上；没有回执卡
+  assert.equal(messenger.replies.length, 0);
+  assert.deepEqual(messenger.reactions, [
+    { messageId: 'om_1', emojiType: 'Get' },
+    { messageId: 'om_2', emojiType: 'Get' },
+  ]);
 
   release();
   await waitFor(() => order.length === 4);
   assert.deepEqual(order, ['start:一', 'end:一', 'start:二', 'end:二']); // 严格串行
-  // 一：回执(蓝)→结果(绿新卡)；二：回执(黄)→开始时刷「已开始」(蓝)→结果(绿新卡)
-  await waitFor(() => messenger.replies.filter((r) => r.card.header.template === 'green').length === 2);
-  assert.equal(messenger.updates.length, 1);
-  assert.equal(messenger.updates[0].card.header.template, 'blue'); // 「已排队」→「已开始」
-  assert.match(messenger.updates[0].card.header.title.content, /已开始/);
-  assert.match(messenger.replies[3].card.body.elements[0].content, /二/);
+  // 一/二：各另发一张结果新卡（绿），串在各自来源消息下
+  await waitFor(() => messenger.replies.length === 2);
+  assert.deepEqual(messenger.replies.map((r) => r.messageId), ['om_1', 'om_2']);
+  assert.ok(messenger.replies.every((r) => r.card.header.template === 'green'));
+  assert.match(messenger.replies[1].card.body.elements[0].content, /二/);
+  assert.equal(messenger.updates.length, 0); // 无回执卡可刷
 });
 
 test('消息驱动：白名单外用户 / 非文本 / 应用消息 / 重复推送被忽略', async () => {
@@ -1139,7 +1450,7 @@ test('消息驱动：白名单外用户 / 非文本 / 应用消息 / 重复推�
   assert.equal(runs.length, 1);
 });
 
-test('消息驱动：runClaude 失败/超时 → 另发失败/超时结果卡片（回执保持已开始）', async () => {
+test('消息驱动：runClaude 失败/超时 → 另发失败/超时结果卡片（受理 Get 表态已在来源上）', async () => {
   const messenger = fakeMessenger();
   const runner = createChatRunner({ herdr: fakeHerdr(),
     cfg: CHAT_CFG,
@@ -1148,8 +1459,9 @@ test('消息驱动：runClaude 失败/超时 → 另发失败/超时结果卡片
     runClaude: async () => ({ ok: false, timedOut: true, error: '超过 60s 未完成，已终止' }),
   });
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '慢任务' }));
-  await waitFor(() => messenger.replies.length === 2);
-  const card = messenger.replies[1].card;
+  await waitFor(() => messenger.replies.length === 1);
+  assert.equal(messenger.reactions.length, 1); // 受理表态已加
+  const card = messenger.replies[0].card;
   assert.equal(card.header.template, 'yellow');
   assert.match(card.header.title.content, /超时/);
   assert.match(card.body.elements[0].content, /超过 60s/);
@@ -1161,9 +1473,9 @@ test('消息驱动：runClaude 失败/超时 → 另发失败/超时结果卡片
     runClaude: async () => ({ ok: false, error: 'claude 退出码 1' }),
   });
   await runner2.handleMessage(msgEvent({ chatType: 'group', text: '会失败', chatId: 'oc_chat2', messageId: 'om_2' }));
-  await waitFor(() => messenger.replies.length === 4);
-  assert.equal(messenger.replies[3].card.header.template, 'orange');
-  assert.match(messenger.replies[3].card.body.elements[0].content, /claude 退出码 1/);
+  await waitFor(() => messenger.replies.length === 2);
+  assert.equal(messenger.replies[1].card.header.template, 'orange');
+  assert.match(messenger.replies[1].card.body.elements[0].content, /claude 退出码 1/);
 });
 
 test('chatForCwd：绑定目录（含子目录）命中，最长前缀优先，目录边界精确', async () => {
@@ -1225,24 +1537,11 @@ test('卡片路由：确认卡按 cwd 发到绑定群，未命中不发卡（无
   }
 });
 
-test('卡片内容：回执/结果卡片与 extractText', () => {
+test('卡片内容：结果卡片与 extractText（受理走 Get 表态，无回执卡）', () => {
   assert.equal(extractText('{"text":"@_user_1  你好 @_user_2 世界"}'), '你好 世界');
   assert.equal(extractText('not-json'), '');
   assert.equal(extractText('{"text":"@_user_1"}'), '');
 
-  const ack = buildTaskAckCard({ prompt: 'p', name: 'Elio', queued: true });
-  assert.equal(ack.header.template, 'yellow');
-  assert.match(ack.header.title.content, /^已排队 · p$/);
-  assert.match(ack.body.elements[0].content, /回复 Elio：p/);
-  assert.match(ack.body.elements[0].content, /排队/);
-  assert.doesNotMatch(ack.body.elements.at(-1).content, /完成后/); // 回执不再承诺「完成后更新」
-  const ack2 = buildTaskAckCard({ prompt: 'p2' });
-  assert.equal(ack2.header.template, 'blue');
-  assert.match(ack2.header.title.content, /^已开始 · p2$/);
-  // 超长指令标题单行截断（truncate 会附加换行提示，标题必须单行）
-  const ack3 = buildTaskAckCard({ prompt: `一${'很长的指令'.repeat(20)}` });
-  assert.ok(!ack3.header.title.content.includes('\n'));
-  assert.ok(ack3.header.title.content.endsWith('…'));
   const ok = buildTaskResultCard({
     ok: true, body: '答案', prompt: '查状态', sessionId: 'sess-abc12345', cwd: '/w',
     durationMs: 1500, costUsd: 0.005, numTurns: 2,
@@ -1251,6 +1550,10 @@ test('卡片内容：回执/结果卡片与 extractText', () => {
   assert.match(ok.header.title.content, /已完成 · 查状态/);
   assert.match(ok.body.elements[0].content, /答案/);
   assert.match(ok.body.elements.at(-1).content, /2s.*2 轮/);
+  // 超长指令标题单行截断（truncate 会附加换行提示，标题必须单行）
+  const long = buildTaskResultCard({ ok: true, body: 'x', prompt: `一${'很长的指令'.repeat(20)}` });
+  assert.ok(!long.header.title.content.includes('\n'));
+  assert.ok(long.header.title.content.endsWith('…'));
   const fail = buildTaskResultCard({ ok: false, body: '崩了' });
   assert.equal(fail.header.template, 'orange');
   assert.match(fail.body.elements[0].content, /崩了/);
@@ -1358,17 +1661,17 @@ test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身�
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccbridge-mirror-'));
   const bridges = []; // 失败路径也要关掉，否则 server 句柄挂住测试进程
   try {
-    // A) 无凭据 → 降级 bot 镜像卡
+    // A) 无凭据 → 降级 bot 镜像卡，受理 Get 表态加在镜像卡上
     const tA = await startBridge({ authFile: path.join(dir, 'none.json') });
     bridges.push(tA.close);
     await post(tA.base, '/hook/userpromptsubmit', { session_id: 'sess-mirror-a', cwd: DEFAULT_BINDING.cwd, prompt: '你好' });
     await waitFor(() => tA.messenger.sentTo.length === 1);
     assert.equal(tA.messenger.userTexts.length, 0);
     assert.match(tA.messenger.sentTo[0].card.header.title.content, /CLI 输入/);
-    await waitFor(() => tA.messenger.updates.length === 1); // bot 镜像卡随即 patch 成受理回执卡
-    assert.match(tA.messenger.updates[0].card.header.title.content, /^已开始 · 你好$/);
-    // Stop 读不到 transcript（远程机器/未落盘）：另发灰色「回合已结束」收尾卡串在镜像卡下，
-    // 回执卡保持「已开始」不动（updates 不再增加）
+    await waitFor(() => tA.messenger.reactions.length === 1);
+    assert.deepEqual(tA.messenger.reactions[0], { messageId: 'msg_1', emojiType: 'Get' }, 'Get 表态加在 bot 镜像卡上');
+    assert.equal(tA.messenger.updates.length, 0, '不再 patch 镜像卡为回执卡');
+    // Stop 读不到 transcript（远程机器/未落盘）：另发灰色「回合已结束」收尾卡串在镜像卡下
     await post(tA.base, '/hook/stop', {
       session_id: 'sess-mirror-a',
       cwd: DEFAULT_BINDING.cwd,
@@ -1379,7 +1682,7 @@ test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身�
     assert.match(tA.messenger.replies[0].card.header.title.content, /回合已结束/);
     assert.equal(tA.messenger.replies[0].card.header.template, 'grey');
     assert.doesNotMatch(tA.messenger.replies[0].card.header.title.content, /已完成/);
-    assert.equal(tA.messenger.updates.length, 1, '回执卡不被改动');
+    assert.equal(tA.messenger.updates.length, 0, '镜像卡不被改动');
     assert.equal(tA.messenger.sentTo.length, 1, '读不到最终文本时不得独立另发卡片');
     await tA.close();
 
@@ -1393,22 +1696,20 @@ test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身�
     assert.equal(tB.messenger.userTexts.length, 0);
     await tB.close();
 
-    // C) 有效凭据（白名单内）→ 以本人身份发文本；受理回执卡串在其下，Stop 结果另发新卡串在其下
+    // C) 有效凭据（白名单内）→ 以本人身份发文本，Get 表态加在该消息上，Stop 结果另发新卡串在其下
     const fileC = path.join(dir, 'c.json');
     fs.writeFileSync(fileC, JSON.stringify({ access_token: 'u-at-c', access_expires_at: Date.now() + 3600_000, refresh_token: 'rt-c', open_id: 'ou_me' }));
-    const tC = await startBridge({ authFile: fileC, allowedOpenIds: ['ou_me'], injectAckName: 'Elio' });
+    const tC = await startBridge({ authFile: fileC, allowedOpenIds: ['ou_me'] });
     bridges.push(tC.close);
     await post(tC.base, '/hook/userpromptsubmit', { session_id: 'sess-mirror-c', cwd: DEFAULT_BINDING.cwd, prompt: '你好C' });
     await waitFor(() => tC.messenger.userTexts.length === 1);
     assert.equal(tC.messenger.userTexts[0].chatId, DEFAULT_BINDING.chatId);
     assert.equal(tC.messenger.userTexts[0].text, '你好C');
     assert.equal(tC.messenger.sentTo.length, 0, '本人身份成功后不应再发 bot 卡');
-    await waitFor(() => tC.messenger.replies.length === 1);
-    assert.equal(tC.messenger.replies[0].messageId, 'umsg_1', '受理回执卡串在本人身份镜像消息下（fake 计数器从 1 起）');
-    assert.match(tC.messenger.replies[0].card.header.title.content, /^已开始 · 你好C$/);
-    assert.match(tC.messenger.replies[0].card.body.elements[0].content, /回复 Elio：你好C/);
-    // Stop 读到本回合最终输出 → 另发新卡「已完成 · 你好C」串在本人身份镜像消息下，
-    // 回执卡保持「已开始」不改动
+    await waitFor(() => tC.messenger.reactions.length === 1);
+    assert.deepEqual(tC.messenger.reactions[0], { messageId: 'umsg_1', emojiType: 'Get' }, '受理 Get 表态加在本人身份镜像消息下（fake 计数器从 1 起）');
+    assert.equal(tC.messenger.replies.length, 0, '受理不再发回执卡');
+    // Stop 读到本回合最终输出 → 另发新卡「已完成 · 你好C」串在本人身份镜像消息下
     const transcriptC = path.join(dir, 'c-transcript.jsonl');
     fs.writeFileSync(
       transcriptC,
@@ -1418,11 +1719,11 @@ test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身�
       ].join('\n') + '\n',
     );
     await post(tC.base, '/hook/stop', { session_id: 'sess-mirror-c', cwd: DEFAULT_BINDING.cwd, transcript_path: transcriptC });
-    await waitFor(() => tC.messenger.replies.length === 2);
-    assert.equal(tC.messenger.replies[1].messageId, 'umsg_1', 'Stop 结果卡串在本人身份镜像消息下');
-    assert.match(tC.messenger.replies[1].card.header.title.content, /已完成 · 你好C/);
-    assert.match(tC.messenger.replies[1].card.body.elements[0].content, /收到，这是最终回复/);
-    assert.equal(tC.messenger.updates.length, 0, '回执卡不被改动');
+    await waitFor(() => tC.messenger.replies.length === 1);
+    assert.equal(tC.messenger.replies[0].messageId, 'umsg_1', 'Stop 结果卡串在本人身份镜像消息下');
+    assert.match(tC.messenger.replies[0].card.header.title.content, /已完成 · 你好C/);
+    assert.match(tC.messenger.replies[0].card.body.elements[0].content, /收到，这是最终回复/);
+    assert.equal(tC.messenger.updates.length, 0, '镜像消息只有表态，无卡片可改动');
   } finally {
     if (prevHerdr === undefined) delete process.env.HERDR_BIN;
     else process.env.HERDR_BIN = prevHerdr;
@@ -1431,12 +1732,51 @@ test('镜像：无凭据/白名单外 → bot 卡；有效凭据 → 本人身�
   }
 });
 
+// ---------- hook 客户端（node:http 长轮询：等待上限只由 timeoutMs 决定） ----------
+
+import http from 'node:http';
+import { postHookJson } from '../src/hook-client.mjs';
+
+test('postHookJson：2xx 回响应体；非 2xx 回空；不可达/超时抛错（上层静默放行）', async () => {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/hook/slow') {
+      // 挂 400ms 才回 —— 证明等待窗口由调用方 timeoutMs 控制，客户端不自带更短上限
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"decision":"allow"}');
+      }, 400);
+      return;
+    }
+    if (req.url === '/hook/never') return; // 永不响应，等客户端超时
+    res.writeHead(404);
+    res.end('nope');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const ok = await postHookJson(`${base}/hook/slow`, '{"x":1}', { timeoutMs: 5000 });
+    assert.equal(ok, '{"decision":"allow"}');
+    const nf = await postHookJson(`${base}/hook/nope`, '{}', { timeoutMs: 5000 });
+    assert.equal(nf, ''); // 非 2xx → 空（fail-open），不抛
+    await assert.rejects(
+      () => postHookJson('http://127.0.0.1:1/hook/pretooluse', '{}', { timeoutMs: 1000 }),
+      /ECONNREFUSED|fetch failed|连接/,
+    );
+    await assert.rejects(
+      () => postHookJson(`${base}/hook/never`, '{}', { timeoutMs: 300 }),
+      /等待 daemon 超过 0s|timeout/i,
+    );
+  } finally {
+    server.close();
+  }
+});
+
 // ---------- 注入模式（herdr agent prompt）与防回环 ----------
 
 import { createBridgeState } from '../src/state.mjs';
 
-function injectFixture(agents, extraCfg = {}) {
-  const herd = fakeHerdr(agents);
+function injectFixture(agents, extraCfg = {}, panes = []) {
+  const herd = fakeHerdr(agents, panes);
   const messenger = fakeMessenger();
   const runs = [];
   const state = createBridgeState();
@@ -1451,57 +1791,74 @@ function injectFixture(agents, extraCfg = {}) {
   return { herd, messenger, runs, state, runner };
 }
 
-test('注入：默认注入最近活跃会话；#N 定向与排队提示；blocked 拒绝；/sessions 列表；无会话回退无头', async () => {
+test('注入：默认注入最近活跃会话；busy 立即 ctrl+enter / 排队前缀；blocked 拒绝；/sessions 列表；无会话回退无头', async () => {
   const agents = [
     { agent: 'claude', pane_id: 'w1:p1', cwd: '/repo/a', agent_status: 'idle', agent_session: { value: 'sid-aaa' }, terminal_title_stripped: '任务A', state_change_seq: 10 },
     { agent: 'claude', pane_id: 'w2:p1', cwd: '/repo/a', agent_status: 'working', agent_session: { value: 'sid-bbb' }, terminal_title_stripped: '任务B', state_change_seq: 20 },
   ];
-  const { herd, messenger, runs, state, runner } = injectFixture(agents, { injectAckName: 'Elio' });
+  const { herd, messenger, runs, state, runner } = injectFixture(agents);
 
-  // 默认目标 = 列表第一位；注入成功 + 受理回执卡（引用指令原文）+ 防环登记
+  // 默认目标 = 列表第一位；注入成功 + Get 受理表态（无回执卡）+ 防环登记
   const ev1 = msgEvent({ chatType: 'group', text: '修复登录页', messageId: 'om_inj_1' });
   await runner.handleMessage(ev1);
-  await waitFor(() => messenger.replies.length === 1);
+  await waitFor(() => messenger.reactions.length === 1);
   assert.equal(herd.prompts.length, 1, '应注入而非无头执行');
   assert.equal(herd.prompts[0].paneId, 'w1:p1');
   assert.equal(herd.prompts[0].text, '修复登录页');
   assert.equal(runs.length, 0);
-  assert.match(messenger.replies[0].card.header.title.content, /^已开始 · 修复登录页$/);
-  assert.match(messenger.replies[0].card.body.elements[0].content, /回复 Elio：修复登录页/);
+  assert.equal(messenger.replies.length, 0, '受理不再发回执卡');
+  assert.deepEqual(messenger.reactions[0], { messageId: 'om_inj_1', emojiType: 'Get' });
+  assert.equal(herd.keys.length, 0, '目标 idle（#1）不需要 ctrl+enter');
   assert.ok(state.isInjectedPrompt('sid-aaa', '修复登录页'), '注入的 prompt 不应再被镜像');
   assert.ok(!state.isInjectedPrompt('sid-aaa', '修复登录页'), '注入额度已被 hook 上报消费，手输同内容应正常镜像');
   const m1 = state.takeMirror('sid-aaa');
   assert.equal(m1?.id, 'om_inj_1', '结果卡应串在用户消息下');
-  assert.equal(m1?.ackId, undefined, '不再记录回执卡 id（结果卡另发新卡，不 patch 回执）');
   assert.equal(m1?.label, '修复登录页', '结果卡标题用指令原文');
 
-  // #2 定向 + working 排队提示（回执卡变体）
+  // #2 定向：目标 working → 注入后自动补 ctrl+enter 立即提交（send-now 打断式 steering）
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '#2 优化搜索', messageId: 'om_inj_2' }));
-  await waitFor(() => messenger.replies.length === 2);
+  await waitFor(() => messenger.reactions.length === 2);
   assert.equal(herd.prompts[1].paneId, 'w2:p1');
   assert.equal(herd.prompts[1].text, '优化搜索');
-  assert.match(messenger.replies[1].card.header.title.content, /排队/);
-  assert.match(messenger.replies[1].card.body.elements[0].content, /回复 Elio：优化搜索/);
+  assert.deepEqual(messenger.reactions[1], { messageId: 'om_inj_2', emojiType: 'Get' });
+  assert.deepEqual(herd.keys[0], { paneId: 'w2:p1', key: 'ctrl+enter' }, 'working 目标补 ctrl+enter 立即执行');
 
-  // blocked：目标会话卡在确认框 → 拒绝注入并提示（文本）
+  // 「排队 」前缀：目标 working 也不打断（不补 ctrl+enter），前缀剥掉后注入正文
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '#2 排队 稍后再优化', messageId: 'om_inj_q' }));
+  await waitFor(() => herd.prompts.length === 3);
+  assert.equal(herd.prompts[2].paneId, 'w2:p1');
+  assert.equal(herd.prompts[2].text, '稍后再优化');
+  assert.equal(herd.keys.length, 1, '排队前缀不打断，keys 不新增');
+
+  // blocked：目标会话卡在确认框 → 拒绝注入；提示按确认卡死活分流（确认卡还挂着 → 指引点卡）
   agents[0].agent_status = 'blocked';
+  runner.setPendingProbe(() => true);
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '再来一条', messageId: 'om_inj_3' }));
   await waitFor(() => messenger.texts.length === 1);
   assert.match(messenger.texts[0].text, /等待权限确认/);
+  assert.match(messenger.texts[0].text, /先处理群里的确认卡/);
+  // 确认卡已超时翻灰（hook 早被收走）→ 指引回终端，远程无法代答
+  runner.setPendingProbe(() => false);
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '又一条', messageId: 'om_inj_4' }));
+  await waitFor(() => messenger.texts.length === 2);
+  assert.match(messenger.texts[1].text, /等待权限确认/);
+  assert.match(messenger.texts[1].text, /已超时失效/);
+  assert.match(messenger.texts[1].text, /回终端/);
+  assert.doesNotMatch(messenger.texts[1].text, /先处理群里的确认卡/);
   agents[0].agent_status = 'idle';
 
   // /sessions 列出会话
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '/sessions' }));
-  await waitFor(() => messenger.texts.length === 2);
-  assert.match(messenger.texts[1].text, /任务A[\s\S]*任务B/);
+  await waitFor(() => messenger.texts.length === 3);
+  assert.match(messenger.texts[2].text, /任务A[\s\S]*任务B/);
 
-  // 目录下没有 herdr 会话（oc_chat2 → /repo/b）→ 回退无头执行（受理回执卡同款）
+  // 目录下没有 herdr 会话（oc_chat2 → /repo/b）→ 回退无头执行（Get 表态同款受理）
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '普通任务', chatId: 'oc_chat2', messageId: 'om_fb_1' }));
   await waitFor(() => runs.length === 1);
-  await waitFor(() => messenger.replies.length === 4); // 回执 + 结果新卡（两者都是 reply）
-  assert.match(messenger.replies[2].card.header.title.content, /已开始/);
-  assert.match(messenger.replies[3].card.body.elements[0].content, /echo:普通任务/);
-  assert.equal(herd.prompts.length, 3, '/sessions 不注入，blocked 已拒绝一条不新增');
+  await waitFor(() => messenger.replies.length === 1); // 只有结果新卡（受理是表态）
+  assert.deepEqual(messenger.reactions[3], { messageId: 'om_fb_1', emojiType: 'Get' });
+  assert.match(messenger.replies[0].card.body.elements[0].content, /echo:普通任务/);
+  assert.equal(herd.prompts.length, 5, '/sessions 不注入；blocked 两次都到 herdr 即被拒，不新增执行');
 });
 
 test('注入防环：本人镜像消息直接丢弃；断路器同内容高频跳闸只放行前两条', async () => {
@@ -1522,4 +1879,92 @@ test('注入防环：本人镜像消息直接丢弃；断路器同内容高频�
   }
   await waitFor(() => messenger.texts.some((t) => /回环/.test(t.text)));
   assert.equal(herd.prompts.length, 2, '断路器只放行前两条');
+});
+
+// ---------- /restart：手机端拉起已退出的 pane 会话 ----------
+
+/** 死 pane 形态：claude 退出后 pane 留在原地，agent 字段消失、cwd 保留 */
+const LIVE_AGENT = (paneId, status = 'idle') => ({
+  agent: 'claude', pane_id: paneId, cwd: '/repo/a', agent_status: status,
+  agent_session: { value: 'sid-live' }, terminal_title_stripped: '活会话', state_change_seq: 10,
+});
+const DEAD_PANE = (paneId, cwd = '/repo/a') => ({
+  pane_id: paneId, cwd, agent_status: 'unknown', terminal_title_stripped: 'ubuntu@vm:~/repo/a',
+});
+
+test('/restart：单一死 pane 自动拉起（--continue）；/restart new 全新；成功后 pane 复活', async () => {
+  const { herd, messenger, runner } = injectFixture([LIVE_AGENT('w1:p1')], {}, [
+    { ...LIVE_AGENT('w1:p1') }, DEAD_PANE('w9:p1'), DEAD_PANE('w8:p1', '/elsewhere'),
+  ]);
+  // w8 不在绑定目录下 → 不算候选；唯一候选 w9 自动拉起
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '/restart', messageId: 'om_rs_1' }));
+  await waitFor(() => messenger.texts.length === 2); // ack + 成功
+  assert.deepEqual(herd.starts, [{ paneId: 'w9:p1', name: 'ccbridge_w9_p1', args: ['--continue'] }]);
+  assert.match(messenger.texts[0].text, /拉起/);
+  assert.match(messenger.texts[0].text, /--continue/);
+  assert.match(messenger.texts[1].text, /已拉起/);
+  assert.match(messenger.texts[1].text, /sid-rest/); // shortId 截断到 8 字符
+  // 复活后不再被视为死 pane：再发 /restart 提示无可重启
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '/restart', messageId: 'om_rs_2' }));
+  await waitFor(() => messenger.texts.length === 3);
+  assert.match(messenger.texts[2].text, /没有可重启/);
+  assert.equal(herd.starts.length, 1);
+
+  // /restart new：全新会话（不 --continue）
+  const t2 = injectFixture([LIVE_AGENT('w1:p1')], {}, [{ ...LIVE_AGENT('w1:p1') }, DEAD_PANE('w9:p1')]);
+  await t2.runner.handleMessage(msgEvent({ chatType: 'group', text: '/restart new', messageId: 'om_rs_3' }));
+  await waitFor(() => t2.messenger.texts.length === 2);
+  assert.deepEqual(t2.herd.starts, [{ paneId: 'w9:p1', name: 'ccbridge_w9_p1', args: [] }]);
+  assert.match(t2.messenger.texts[0].text, /全新会话/);
+});
+
+test('/restart：多候选列出让用户指定；显式 pane 校验（占用/不在目录）；失败如实回报', async () => {
+  // 1) 两个死 pane → 列表 + 不拉起
+  let t = injectFixture([LIVE_AGENT('w1:p1')], {}, [
+    { ...LIVE_AGENT('w1:p1') }, DEAD_PANE('w9:p1'), DEAD_PANE('w9:p2', '/repo/a/sub'),
+  ]);
+  await t.runner.handleMessage(msgEvent({ chatType: 'group', text: '/重启', messageId: 'om_rs_4' }));
+  await waitFor(() => t.messenger.texts.length === 1);
+  assert.match(t.messenger.texts[0].text, /2 个可重启/);
+  assert.match(t.messenger.texts[0].text, /w9:p1[\s\S]*w9:p2/);
+  assert.equal(t.herd.starts.length, 0);
+
+  // 2) 指定运行中的 pane → 拒绝；指定目录外的 pane → 拒绝；然后指定正确 pane → 拉起
+  await t.runner.handleMessage(msgEvent({ chatType: 'group', text: '/restart w1:p1', messageId: 'om_rs_5' }));
+  await waitFor(() => t.messenger.texts.length === 2);
+  assert.match(t.messenger.texts[1].text, /运行中的会话/);
+  assert.equal(t.herd.starts.length, 0);
+  await t.runner.handleMessage(msgEvent({ chatType: 'group', text: '/restart w7:p9', messageId: 'om_rs_6' }));
+  await waitFor(() => t.messenger.texts.length === 3);
+  assert.match(t.messenger.texts[2].text, /不在/);
+  await t.runner.handleMessage(msgEvent({ chatType: 'group', text: '/restart w9:p2', messageId: 'om_rs_7' }));
+  await waitFor(() => t.messenger.texts.length === 5); // ack + 成功
+  assert.deepEqual(t.herd.starts.map((s) => s.paneId), ['w9:p2']);
+
+  // 3) 拉起失败（agent_not_ready：停在信任确认等界面）→ 如实说明进程状态
+  const herd = fakeHerdr([LIVE_AGENT('w1:p1')], [DEAD_PANE('w9:p1')]);
+  herd.startAgentInPane = async () => ({ ok: false, error: 'agent_not_ready: blocked during startup', agent: null });
+  const messenger = fakeMessenger();
+  const runner = createChatRunner({
+    herdr: herd,
+    cfg: CHAT_CFG,
+    messenger,
+    client: fakeLarkClient(),
+    state: createBridgeState(),
+  });
+  await runner.handleMessage(msgEvent({ chatType: 'group', text: '/restart', messageId: 'om_rs_8' }));
+  await waitFor(() => messenger.texts.length === 2);
+  assert.match(messenger.texts[1].text, /agent_not_ready/);
+  assert.match(messenger.texts[1].text, /确认界面/);
+  assert.match(messenger.texts[1].text, /可稍后重试/);
+
+  // 4) 没有任何死 pane 时 /sessions 列表不出现「已退出」段；有则出现并带 pane id
+  await t.runner.handleMessage(msgEvent({ chatType: 'group', text: '/sessions', messageId: 'om_rs_9' }));
+  await waitFor(() => t.messenger.texts.length === 6);
+  assert.match(t.messenger.texts[5].text, /已退出/);
+  assert.match(t.messenger.texts[5].text, /w9:p1/); // 剩下那个未拉起的死 pane
+  const clean = injectFixture([LIVE_AGENT('w1:p1')], {}, [{ ...LIVE_AGENT('w1:p1') }]);
+  await clean.runner.handleMessage(msgEvent({ chatType: 'group', text: '/sessions', messageId: 'om_rs_10' }));
+  await waitFor(() => clean.messenger.texts.length === 1);
+  assert.doesNotMatch(clean.messenger.texts[0].text, /已退出/);
 });

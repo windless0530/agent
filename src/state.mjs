@@ -44,7 +44,7 @@ export function createBridgeState() {
 
   return {
     /** 记一条待回复的镜像（或注入来源消息）：label = 指令原文（结果卡标题用）。
-     *  完成时在来源消息下**另发**结果卡——受理回执卡保持「已开始」不改动 */
+     *  完成时在来源消息下**另发**结果卡（受理是来源消息上的 Get 表态，无受理卡） */
     enqueueMirror(sid, messageId, label = '') {
       if (!sid || !messageId) return;
       const q = mirrorQueue.get(sid) || [];

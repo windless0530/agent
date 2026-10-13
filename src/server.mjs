@@ -12,10 +12,9 @@ import {
   buildResultCard,
   buildNotifyCard,
   buildPromptMirrorCard,
-  buildTaskAckCard,
   buildTaskResultCard,
 } from './cards.mjs';
-import { findAgentBySession, readPane } from './herdr.mjs';
+import { findAgentBySession, readPane, sendKeys as herdrSendKeys } from './herdr.mjs';
 import { parseDialogOptions, dialogHasAutoRow } from './dialog.mjs';
 import { getUserAccessToken } from './auth.mjs';
 import { createBridgeState } from './state.mjs';
@@ -100,10 +99,11 @@ function readBody(req, limit = 1024 * 1024) {
  * cc-bridge daemon 核心：HTTP 服务 + 挂起请求队列 + 免确认规则。
  * messenger 只需实现 sendCard(card)->messageId 与 updateCard(messageId, card)。
  */
-export function createBridge({ cfg, messenger, chat = null, bridgeState = null, paneReader = null }) {
-  const pending = new Map(); // rid -> { res, messageId, meta, timer, settled }
+export function createBridge({ cfg, messenger, chat = null, bridgeState = null, paneReader = null, paneResolver = null, keySender = null }) {
+  const pending = new Map(); // rid -> { res, messageId, meta, timer, settled, dialog? }
   const recentResolved = new Map(); // session_id -> resolve 时间戳（抑制迟到的 permission_prompt 通知）
   const recentStop = new Map(); // session_id -> Stop 输出卡时间戳（抑制其后的 idle_prompt 空闲提醒）
+  const sendKeysOf = keySender || ((paneId, key) => herdrSendKeys(paneId, key));
   const st = bridgeState || createBridgeState(); // 镜像队列 + 防回环（与 chat runner 共享）
   const allowRules = parseSeedRules(cfg.allow);
   const state = { ws: 'init', startedAt: Date.now(), wsStatusProvider: null };
@@ -149,6 +149,13 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
 
   // ---------- 挂起请求生命周期 ----------
 
+  /** 只在窗口期内被查询的小表：写入时顺手清扫过期项，防多日运行无限增长 */
+  function setWithPrune(map, key, ttlMs) {
+    const now = Date.now();
+    for (const [k, v] of map) if (now - v > ttlMs) map.delete(k);
+    map.set(key, now);
+  }
+
   async function settle(rid, { act, operator, choice }) {
     const entry = pending.get(rid);
     if (!entry || entry.settled) return;
@@ -156,7 +163,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
     clearTimeout(entry.timer);
     pending.delete(rid);
     const { res, messageId, meta } = entry;
-    if (meta.session) recentResolved.set(meta.session, Date.now());
+    if (meta.session) setWithPrune(recentResolved, meta.session, 120_000);
     const DENY_REASON = '用户在飞书上拒绝了该操作';
     const isPR = meta.event === 'permissionrequest';
 
@@ -197,6 +204,90 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
     return { tool: meta.tool, prefix: rulePrefix(meta.tool, meta.input) };
   }
 
+  // ---------- 终端确认框代答（dialog 模式） ----------
+  // herdr pane 会话的确认卡没有寿命：hook 已立即放行，Claude Code 停在本地确认框上
+  // （无限等，不受任何 timeout 限制）。点卡时 daemon 读屏验框 → 按选项映射发方向键/
+  // Enter（拒绝发 Esc）→ 复验框消失。任何一步对不上（框没了/选项变了/发键失败）都
+  // 不硬按，卡片翻灰提示回终端处理——绝不往不明状态的 pane 里发 Enter/Esc。
+
+  async function readDialogOnce(sessionId) {
+    try {
+      return paneReader ? await paneReader(sessionId) : await readDialogText(sessionId);
+    } catch {
+      return '';
+    }
+  }
+
+  /** 卡片选项 act → 终端确认框行号（0 起）；-1 = 对不上（框变了，不代答）；-2 = 拒绝（Esc） */
+  function dialogRowIndex(parsed, options, act) {
+    if (act === 'deny') return -2;
+    if (act === 'allow' || act === 'always') {
+      // 无建议对话框（固定三键卡）meta.options 仍以 [Yes, No] 起头；都选纯 Yes 行
+      return parsed.indexOf('Yes');
+    }
+    const opt = (options || []).find((o) => o.act === act);
+    if (!opt) return -1;
+    // 建议行/auto 行完整文案与终端逐字一致（同一渲染模板）；兜底前缀匹配（折行合并差异）
+    let i = parsed.indexOf(opt.label);
+    if (i < 0 && opt.label.length > 24) i = parsed.findIndex((p) => p.startsWith(opt.label.slice(0, 24)));
+    return i;
+  }
+
+  async function answerDialogViaKeys(rid, entry, { act, operator, choice }) {
+    const { pane, session } = entry.dialog;
+    const parsed = parseDialogOptions(await readDialogOnce(session));
+    if (!parsed.length) {
+      // 框已不在：本地已处理（允许/拒绝/Esc），卡片跟着翻灰即可
+      log('resolve', rid, entry.meta.tool, 'act=local（点卡时终端确认框已不在）');
+      return settle(rid, { act: 'local', operator });
+    }
+    const row = dialogRowIndex(parsed, entry.meta.options, act);
+    if (row === -1) {
+      log('resolve', rid, entry.meta.tool, 'act=changed（终端选项与卡片不一致，未代答）');
+      return settle(rid, { act: 'changed', operator });
+    }
+    const keys = [];
+    if (row === -2) keys.push('Escape');
+    else {
+      for (let i = 0; i < row; i++) keys.push('Down');
+      keys.push('Enter');
+    }
+    entry.dialog.answering = true; // 按键放行的工具运行不被 PostToolUse 抢答成「本地允许」
+    for (const k of keys) {
+      if (!(await sendKeysOf(pane, k))) {
+        entry.dialog.answering = false;
+        log('resolve', rid, entry.meta.tool, `act=changed（发键 ${k} 失败，未代答）`);
+        return settle(rid, { act: 'changed', operator });
+      }
+      await new Promise((r) => setTimeout(r, 80)); // 按键间隔，给终端渲染留时间
+    }
+    // 复验：放行/拒绝后框应消失；两拍后仍在则不硬猜结果（可能框换了内容）
+    for (const delay of [500, 800]) {
+      await new Promise((r) => setTimeout(r, delay));
+      if (!parseDialogOptions(await readDialogOnce(session)).length) {
+        entry.dialog.answering = false;
+        const normAct = act === 'deny' ? 'deny' : act === 'always' ? 'always' : 'allow';
+        return settle(rid, { act: normAct, operator, choice });
+      }
+    }
+    entry.dialog.answering = false;
+    log('resolve', rid, entry.meta.tool, 'act=changed（代答后确认框仍在，请在终端处理）');
+    return settle(rid, { act: 'changed', operator });
+  }
+
+  /** 该会话新确认到达时清算旧代答卡：框已不在（旧确认被本地处理掉）→ 翻灰；
+   *  框还在（并行确认/新框未渲染）→ 留给点卡时的读屏校验或 Stop 兜底。 */
+  async function sweepDialogPendings(sessionId, excludeRid) {
+    if (!sessionId) return;
+    const olds = [...pending.entries()].filter(
+      ([rid, e]) => rid !== excludeRid && !e.settled && !e.dialog?.answering && e.dialog?.session === sessionId,
+    );
+    if (!olds.length) return;
+    if (parseDialogOptions(await readDialogOnce(sessionId)).length) return;
+    for (const [rid] of olds) settle(rid, { act: 'local' });
+    log('resolve', `会话 ${shortId(sessionId)} 的 ${olds.length} 张旧确认卡所对框已不在，翻为已在终端处理`);
+  }
+
   // ---------- 终端本地作答感知 ----------
   // Claude Code 不会因为用户在终端本地回答了确认框而通知 hook（hook 进程也不被杀），
   // 飞书卡片只能靠以下事件推断「已在本地解决」：
@@ -221,6 +312,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
     const match = [...pending.entries()].find(
       ([, e]) =>
         !e.settled &&
+        !e.dialog?.answering && // 代答进行中：按键放行的工具运行不该抢答成「本地允许」
         e.meta.session === sid &&
         e.meta.tool === payload.tool_name &&
         canonicalJson(e.meta.input) === canonicalJson(payload.tool_input),
@@ -233,7 +325,9 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
   function settleLocalFromStop(payload) {
     const sid = payload.session_id;
     if (!sid) return 0;
-    const matches = [...pending.entries()].filter(([, e]) => !e.settled && e.meta.session === sid);
+    const matches = [...pending.entries()].filter(
+      ([, e]) => !e.settled && !e.dialog?.answering && e.meta.session === sid,
+    );
     for (const [rid] of matches) settle(rid, { act: 'local' });
     return matches.length;
   }
@@ -241,6 +335,8 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
   /** 从会话 transcript（JSONL）取「本回合」最后一条 assistant 文本，即该回合的最终输出。
    *  从后向前找，跳过纯 tool_use / thinking / 坏行，回溯到本回合的发起 user 消息为止——
    *  不越界，否则无文本的回合会把上一轮的旧输出捞出来冒充本轮结果。
+   *  以 tool_use 结尾的消息（stop_reason=tool_use，如 steering 插话的回应）回合还在继续，
+   *  其文本只是中间输出，同样跳过——只认回合收尾（end_turn 等）的文本。
    *  远程机器的本地路径读不到时返回空串。 */
   function finalTurnText(transcriptPath) {
     if (!transcriptPath || typeof transcriptPath !== 'string') return '';
@@ -260,6 +356,11 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
         // 本回合发起消息（非 tool_result 的 user 条目）之前已是上一回合，停止回溯
         if (entry?.type === 'user' && !isToolResult(entry)) break;
         if (entry?.type !== 'assistant') continue;
+        // tool_use 结尾 = 回合还在继续（含 steering 插话回应），其文本不算最终结果。
+        // Stop hook 可能先于末条落盘触发（stop_hook_summary 实测早于末条 assistant 写入），
+        // 半截 transcript 恰好落在中间输出上：跳过它返回空，交给上层重读拿到真正的
+        // 回合收尾文本，而不是把中间输出当结果发卡。旧格式无 stop_reason 仍可入选。
+        if (entry.message?.stop_reason === 'tool_use') continue;
         const blocks = entry.message?.content;
         const texts = Array.isArray(blocks)
           ? blocks.filter((b) => b?.type === 'text' && b.text).map((b) => b.text)
@@ -274,14 +375,19 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
     return '';
   }
 
-  /** Stop 触发时 transcript 末行可能尚未落盘（hook 与写盘并发）：文件在但首次读不到
-   *  最终文本时隔 300ms 重读一次；文件本就不存在（远程机器）则不重试。 */
+  /** Stop 触发时 transcript 末行可能尚未落盘（hook 与写盘并发，末条或为半行）：
+   *  文件在但读不到回合收尾文本时按 300/800ms 重读（与读屏重试同款节奏）；
+   *  文件本就不存在（远程机器）则不重试。 */
   async function finalTurnTextWithRetry(transcriptPath) {
-    const first = finalTurnText(transcriptPath);
-    if (first) return first;
-    if (!transcriptPath || typeof transcriptPath !== 'string' || !fs.existsSync(transcriptPath)) return '';
-    await new Promise((r) => setTimeout(r, 300));
-    return finalTurnText(transcriptPath);
+    if (!transcriptPath || typeof transcriptPath !== 'string' || !fs.existsSync(transcriptPath)) {
+      return finalTurnText(transcriptPath);
+    }
+    for (const delay of [0, 300, 800]) {
+      if (delay) await new Promise((r) => setTimeout(r, delay));
+      const text = finalTurnText(transcriptPath);
+      if (text) return text;
+    }
+    return '';
   }
 
 
@@ -336,6 +442,17 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
       );
     }
     const options = confirmOptions({ suggestions, cwd: payload.cwd, autoRow });
+    // 会话在 herdr 管的终端 pane 里 → 代答模式：卡片无寿命，hook 立即放行，Claude Code
+    // 停在本地确认框上等（无限期），点卡由 daemon 读屏验框后发键代答。无 pane（无头 /
+    // 远程机器）→ 长轮询模式：hook 阻塞等按钮，受 timeoutSec（≤580s）约束。
+    let pane = null;
+    try {
+      pane = paneResolver
+        ? await paneResolver(payload.session_id)
+        : (await findAgentBySession(payload.session_id))?.pane_id || null;
+    } catch {
+      pane = null;
+    }
     const rid = crypto.randomUUID();
     let messageId;
     try {
@@ -350,6 +467,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
           timeoutSec: cfg.timeoutSec,
           suggestions,
           autoRow,
+          dialog: !!pane,
         }),
       );
     } catch (e) {
@@ -363,7 +481,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
     log('card', `确认卡 ${rid.slice(0, 8)} message_id=${messageId}`);
 
     const entry = {
-      res,
+      res: pane ? null : res,
       messageId,
       settled: false,
       timer: null,
@@ -379,6 +497,13 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
         options,
       },
     };
+    if (pane) {
+      entry.dialog = { pane, session: payload.session_id, answering: false };
+      pending.set(rid, entry);
+      log('pending', rid, tool, `（代答模式 pane=${pane}，当前 ${pending.size} 个待确认）`);
+      sweepDialogPendings(payload.session_id, rid).catch(() => {});
+      return sendJson(res, 200, ''); // 立即放行：Claude Code 走本地确认框，卡片随时可点
+    }
     pending.set(rid, entry);
     log('pending', rid, tool, `（当前 ${pending.size} 个待确认）`);
     entry.timer = setTimeout(() => settle(rid, { act: 'timeout' }), cfg.timeoutSec * 1000);
@@ -397,7 +522,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
         return sendJson(res, 200, '');
       }
       // 「任务完成」结果卡（notifyStop: false 关闭，默认开）：完成时**另发一张新卡**，
-      // 受理回执卡保持「已开始 · 指令」不改动。结果卡优先串在来源消息下（终端镜像/
+      // 串在来源消息下（终端镜像/
       // 群注入的来源），没有来源则独立发。只在读得到 transcript 且能取到本回合最终
       // assistant 文本时才发「🏁 已完成」——必须带真实最终输出；读不到输出但有来源
       // 消息时发灰色「◌ 回合已结束」收尾（不冒充已完成）；两者都没有（无镜像的会话
@@ -431,7 +556,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
           }
           if (!messageId) messageId = await sendCardRouted(payload.cwd, card);
           if (messageId) {
-            if (payload.session_id) recentStop.set(payload.session_id, Date.now());
+            if (payload.session_id) setWithPrune(recentStop, payload.session_id, 900_000);
             log('card', `Stop 结果卡${!output ? '（回合已结束，未读到输出）' : ''} message_id=${messageId}${via}`);
           } else {
             log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，跳过 Stop 结果卡`);
@@ -514,14 +639,15 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
       const agent = await findAgentBySession(sid);
       const label = agent?.terminal_title_stripped || (sid ? shortId(sid) : '');
 
-      // 受理回执卡：与注入/无头路径同一张（引用指令原文）；完成后不改动它，
-      // Stop 结果卡另发、串在来源消息下
+      // 受理表态：给来源消息（本人身份镜像文本 / 降级 bot 镜像卡）加 Get 表情回复，
+      // 不再另发「已开始」回执卡；失败只记日志不影响后续 Stop 结果卡
       const ackOf = async (sourceId) => {
         try {
-          return await messenger.replyCard(sourceId, buildTaskAckCard({ prompt, name: cfg.injectAckName }));
+          await messenger.addReaction(sourceId, 'Get');
+          return true;
         } catch (e) {
-          log('error', '发送受理回执卡失败（Stop 将串在来源消息下）:', e.message);
-          return null;
+          log('error', '添加受理 Get 表态失败:', e.message);
+          return false;
         }
       };
 
@@ -550,13 +676,9 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
         }
       }
 
-      // 2) 降级：bot 镜像卡发出后直接 patch 成受理回执卡（同一张卡承担「镜像 + 受理」）
+      // 2) 降级：bot 镜像卡即受理载体（Get 表态加在卡上），Stop 结果卡串在该卡下
       const messageId = await messenger.sendCardTo(target, buildPromptMirrorCard({ prompt, title: label, sid, cwd: payload.cwd }));
-      try {
-        await messenger.updateCard(messageId, buildTaskAckCard({ prompt, name: cfg.injectAckName }));
-      } catch (e) {
-        log('error', '镜像卡 patch 回执失败（Stop 将串在该卡下）:', e.message);
-      }
+      await ackOf(messageId);
       st.enqueueMirror(sid, messageId, prompt);
       log('card', `镜像卡 message_id=${messageId}${label ? `（${truncate(label, 30)}）` : ''}`);
     } catch (e) {
@@ -619,6 +741,9 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
       if (!opt?.updates?.length) return; // 该选项不存在（数据异常），忽略本次点击
       choice = { label: opt.label, updates: opt.updates };
     }
+    // 代答模式：不走 hook 连接，读屏验框后发键代答本地确认框
+    const entry = pending.get(rid);
+    if (entry.dialog) return answerDialogViaKeys(rid, entry, { act, operator, choice });
     const normAct =
       act === 'deny'
         ? 'deny'
@@ -677,7 +802,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
   }
 
   function sendJson(res, code, obj) {
-    if (res.writableEnded || res.destroyed) return;
+    if (!res || res.writableEnded || res.destroyed) return;
     const body = obj === '' ? '' : JSON.stringify(obj);
     res.writeHead(code, {
       'Content-Type': 'application/json; charset=utf-8',
@@ -755,6 +880,8 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
       state.wsStatusProvider = fn;
     },
     pendingSize: () => pending.size,
+    /** 该会话是否还有挂起的确认卡（chat runner 的 blocked 注入提示据此分流文案） */
+    hasPendingFor: (sid) => [...pending.values()].some((e) => !e.settled && e.meta.session === sid),
     rules: () => allowRules,
   };
 }

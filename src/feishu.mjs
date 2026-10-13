@@ -45,7 +45,7 @@ export function createMessenger(cfg) {
       }
     },
 
-    /** 回复指定消息（引用形式）一张卡片，返回 message_id；用于消息驱动指令的回执 */
+    /** 回复指定消息（引用形式）一张卡片，返回 message_id；用于把结果卡串在来源消息下 */
     async replyCard(messageId, card) {
       const resp = await client.im.v1.message.reply({
         path: { message_id: messageId },
@@ -70,6 +70,19 @@ export function createMessenger(cfg) {
       if (resp.code !== 0) {
         throw new Error(`回复消息失败 code=${resp.code} msg=${resp.msg}`);
       }
+    },
+
+    /** 给消息添加表情回复（受理表态用，如绿色 GET 贴纸）。emoji key 见开放平台
+     *  「表情文案说明」：OK / THUMBSUP / Get / DONE …（注意大小写敏感，GET 贴纸是 Get） */
+    async addReaction(messageId, emojiType) {
+      const resp = await client.im.v1.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+      if (resp.code !== 0) {
+        throw new Error(`添加表情回复失败 code=${resp.code} msg=${resp.msg}`);
+      }
+      return resp.data?.reaction_id;
     },
 
     /** 以用户本人身份发文本消息（user_access_token 鉴权，SDK 不托管该 token，裸调 OpenAPI）。

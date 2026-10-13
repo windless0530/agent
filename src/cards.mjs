@@ -225,7 +225,7 @@ function note(text) {
  * 按钮放完整文案、按单行预算词边界截断（见 BTN_TEXT_MAX）；放不下的详情左对齐
  * 补在正文里。无 suggestions（旧 CLI / 不读该数组的确认框，如文件编辑）时回退固定三键。
  */
-export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec, suggestions = [], autoRow = false }) {
+export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec, suggestions = [], autoRow = false, dialog = false }) {
   const lines = [
     `**工具**：\`${tool}\`　${summary.headline}`,
     summary.detail,
@@ -264,7 +264,11 @@ export function buildConfirmCard({ rid, tool, summary, cwd, session, timeoutSec,
         { tag: 'markdown', content: lines.join('\n') },
         // schema 2.0 已移除 action 组件，按钮直接放在 elements 里（官方文档指引）
         ...buttons,
-        note(`${now()} · ${timeoutSec}s 未响应将回退为本地确认`),
+        note(
+          dialog
+            ? `${now()} · 无超时，可随时点按（终端同步显示，先到先得）`
+            : `${now()} · ${timeoutSec}s 未响应将回退为本地确认`,
+        ),
       ],
     },
   };
@@ -278,6 +282,7 @@ const RESULT_META = {
   cancel: { title: '🚪 已取消（客户端断开）', template: 'grey' },
   'local-allow': { title: '🖥️ 已在终端允许', template: 'green' },
   local: { title: '🖥️ 已在终端处理', template: 'grey' },
+  changed: { title: '⚠️ 终端确认框已变化，请在终端处理', template: 'grey' },
 };
 
 /** 点了具体选项（suggest/auto）时，按回传条目类型给结果卡片标题 */
@@ -316,6 +321,9 @@ export function buildResultCard({ tool, summary, cwd, session, nativePersist, ch
   if (who && ['allow', 'always', 'deny'].includes(act)) lines.push(`**操作人**：${who}`);
   if (act === 'local-allow' || act === 'local') {
     lines.push('该确认已在 Claude Code 终端处理，卡片按钮已失效');
+  }
+  if (act === 'changed') {
+    lines.push('点卡时终端确认框已不在或选项与卡片不一致，代答未执行，卡片按钮已失效');
   }
 
   return {
@@ -391,31 +399,7 @@ export function buildPromptMirrorCard({ prompt, title = '', sid = '', cwd = '' }
 /** 卡片标题里的指令原文：单行截断（truncate 会附加换行提示，标题必须单行） */
 const headOf = (prompt, n = 30) => (prompt ? ` · ${clip(prompt, n)}` : '');
 
-/** 任务受理回执卡：飞书注入 / 终端镜像 / 无头执行统一用这张（引用指令原文）。
- *  标题带指令原文（超卡片宽度单行截断加 …）；完成后**不改动本卡**——结果另发
- *  一张新卡（串在来源消息下），本卡永久停留在「已开始」受理时刻。
- *  name（injectAckName）非空时引用行带「回复 {name}：」 */
-export function buildTaskAckCard({ prompt, name = '', queued = false }) {
-  const quote = `${name ? `回复 ${name}：` : ''}${truncate(prompt, 400)}`;
-  const lines = [`<font color='grey'>💬 ${quote}</font>`];
-  if (queued) lines.push(`<font color='grey'>⏳ 已排队：目标会话当前有任务在跑</font>`);
-  return {
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      title: { tag: 'plain_text', content: queued ? `已排队${headOf(prompt)}` : `已开始${headOf(prompt)}` },
-      template: queued ? 'yellow' : 'blue',
-    },
-    body: {
-      elements: [
-        { tag: 'markdown', content: lines.join('\n') },
-        note(`${now()} · ${hostname()}`),
-      ],
-    },
-  };
-}
-
-/** 任务结果卡：完成时**另发的新卡**（受理回执卡保持「已开始」不改动），串在来源
+/** 任务结果卡：完成时**另发的新卡**（受理是来源消息上的 Get 表态，不再有受理卡），串在来源
  *  消息下；无来源消息的 Stop 输出独立发。标题带指令原文（prompt），正文为最终输出；
  *  失败/超时为橙/黄变体；muted 为灰色「回合已结束」——Stop 读不到本回合最终文本时的
  *  收尾（给回合一个结束信号，但不冒充「已完成」）。三条路径（注入/镜像/无头）共用 */
