@@ -1,6 +1,6 @@
 # cc-bridge
 
-把任意位置运行的 **Claude Code** 的关键消息（人工确认、工具授权等）通过**飞书交互卡片**推送到手机，在飞书里点「允许 / 拒绝」后 Claude Code 继续执行。也支持**反向驱动**：把「飞书群 ↔ 本地目录」配成一组绑定（`bindings` 配置），绑定群里的消息 = 在该目录的终端 claude cli 里输入，回复直接发回该群；该目录（含子目录）下会话的确认卡也自动路由到对应群——多 repo / 多 worktree 各绑各的群，互不串线。
+把任意位置运行的 **Claude Code** 的关键消息（人工确认、工具授权、**选择题提问、计划审批**等）通过**飞书交互卡片**推送到手机，在飞书里点「允许 / 拒绝 / 选 2 / 批准」后 Claude Code 继续执行。也支持**反向驱动**：把「飞书群 ↔ 本地目录」配成一组绑定（`bindings` 配置），绑定群里的消息 = 在该目录的终端 claude cli 里输入，回复直接发回该群；该目录（含子目录）下会话的确认卡也自动路由到对应群——多 repo / 多 worktree 各绑各的群，互不串线。
 
 ```
 Claude Code（任意机器）              cc-bridge daemon（一台机器）             飞书
@@ -20,7 +20,8 @@ Claude Code（任意机器）              cc-bridge daemon（一台机器）   
    - 确认类 hook：**`PermissionRequest`**（新版 CLI，自动探测；恰好在 Claude Code 要弹权限确认框时触发，已被允许的操作不会重复打扰）或 **`PreToolUse`**（旧版 CLI 回退，每次工具调用都触发）。hook 进程把工具调用详情 POST 给 daemon，按会话能否读到终端分两种模式：
      - **代答模式**（会话在 herdr 管的终端 pane 里，本机交互会话的常态）：daemon 发卡后 **hook 立即放行**，Claude Code 停在本地确认框上无限期等；卡片**没有超时寿命**，点按钮时 daemon 读屏校验确认框还在、选项与卡片一致，再按选项映射发方向键 / `Enter`（拒绝发 `Esc`）代答，并复验框已消失。手机隔一天回来点也有效。本地终端先答的话，卡片由 PostToolUse / Stop / 新确认到达时的读屏清扫自动翻灰。
      - **长轮询模式**（无头 / 远程接入机器，pane 读不到）：hook 阻塞等待，你点卡片后决策以 hook JSON 返回，Claude Code 据此放行或拒绝（拒绝原因会告知 Claude，它会调整方案）。受 `timeoutSec` 约束。
-   - `Notification`（可选）：Claude 空闲等待输入等通知，转发为纯通知卡片。其中 `permission_prompt` 类通知（确认框闲置 ~6s 才触发）**在该会话已有挂起确认卡或刚被点击解决的 60s 内自动抑制**，避免与交互确认卡重复打扰；仅当 cc-bridge 未接管审批（发卡失败/并发超限回退本地确认）时才转发，作为手机端唯一提醒。`idle_prompt`（"Claude is waiting for your input"）**在该会话发过回合结果卡/「回合已结束」收尾卡的 10 分钟内同样抑制**（卡片已带最终回复或回合结束状态）。
+   - `Notification`（可选）：Claude 空闲等待输入等通知，转发为纯通知卡片。其中 `permission_prompt` 类通知（确认框闲置 ~6s 才触发）**在该会话已有挂起确认卡或刚被点击解决的 60s 内自动抑制**，避免与交互确认卡重复打扰；仅当 cc-bridge 未接管审批（发卡失败/并发超限回退本地确认）时才转发，作为手机端唯一提醒。`idle_prompt`（"Claude is waiting for your input"）**在该会话发过回合结果卡/「回合已结束」收尾卡或还挂着提问/审批卡的 10 分钟内同样抑制**（卡片已带最终回复、回合结束状态或待答问题）。
+   - **选择题 hook**（`AskUserQuestion|ExitPlanMode`，随 install-hooks 一并安装同事件的 PreToolUse/PostToolUse 两条）：这两类工具在终端渲染「编号选择题」对话框（规划模式提问、计划审批 `Would you like to proceed?`），**不触发 PermissionRequest、也没有阻塞语义**——PreToolUse 仅当触发器（hook 立即空体放行），daemon 起观察器读屏轮询（600ms 起，之后 1500ms，无框 10 拍后放慢到 4s，上限 `questionWatchSec`；到点只停轮询，已发卡片仍可点）逐题发**「❓ 提问卡 / 📋 计划待审批」**：问题、选项（label/描述用 hook payload 的干净文本配对补全，剥掉终端追加的 "Type something" / "Chat about this" 元选项行）、多选题勾选（Space）+「确认提交」、审批卡三键（批准 auto / 批准手动 / 不批）。点卡走与权限代答相同的「读屏验框 → 方向键（含 Up）/Enter/Space/Esc」路径，选项行号按屏幕实况算。多问题的「Review your answers」复审框在**答案全部经卡片代答**时自动提交（纯确认不打扰）；终端答的则照常发卡。PostToolUse 携带 `Your questions have been answered: "Q"="A"` / `User has approved your plan` 把剩余卡片收尾翻「🖥️ 已作答」并带答案。这些卡片同样无寿命、无 timeoutSec 约束（hook 从不阻塞）。
 2. 超时只作用于**长轮询模式**（默认 300s，可配 `timeoutSec`，上限 580）：到点返回空决策，交互式会话回退为本地正常确认流程（**fail-open**，bridge 挂掉也不影响 Claude Code 使用）；无头等无法弹框的会话中，Claude Code 对「无决策」本身会拒绝该工具调用——手机审批就是这类会话唯一的人工通道。上限的根源是 Claude Code 对 hook 运行时长有 **600s 硬上限**：到点 hook 进程被杀，远程从此无法代答——这正是代答模式让 hook 立即放行的原因。
 3. **终端本地作答联动**：Claude Code 不会因为你在终端本地回答了确认框而通知任何 hook（hook 进程与飞书卡片都会继续挂着），daemon 靠 `install-hooks` 一并安装的 `PostToolUse` / `Stop` 两个事件感知本地作答：同会话同工具同参数的工具确实执行了（PostToolUse，键序无关严格匹配，防并行同工具任务误伤）→ 卡片刷成「🖥️ 已在终端允许」；回合结束（Stop）→ 该会话剩余挂起卡片一律刷成「🖥️ 已在终端处理」（本地拒绝 / Esc 取消的兜底）。结算同时向仍挂起的 hook 连接回空体释放进程，卡片按钮随之失效。`Stop` 还会**另发**「🏁 已完成 · 指令原文」结果卡（受理不占卡片，见第 5/6 条的 Get 表态），**内容即该回合的最终输出**（读 `transcript_path` 里本回合最后一条 assistant 文本，回溯到本回合发起消息为止；`stop_reason=tool_use` 结尾的消息（steering 插话的回应等）回合还在继续、只是中间输出，跳过不认——只认回合收尾（`end_turn` 等）的文本，飞书群里的最后一张卡不再是 "waiting for your input" 空话），优先串在该回合的来源消息下（终端镜像 / 群注入），没有来源则独立发。**只在读得到 transcript 且取得到本回合最终文本时才发**：读不到（远程机器路径 / 末行尚未落盘——Stop hook 可能抢在末条写盘前触发，隔 300/800ms 重读仍失败）时，有来源消息则发灰色「◌ 回合已结束」收尾卡（不冒充已完成），无来源不发任何卡；`notifyStop: false` 全关。消息驱动会话的 Stop 不推（回复卡片已带结果）。
 4. **选项与终端确认框一一对应**：Claude Code 在 `permission_suggestions` 里给出确认框的选项建议，卡片按 cli.js 同款模板渲染为编号按钮（`1. Yes` / `2. Yes, and don't ask again for: <命令>` / …，个数与文案与终端一致）。飞书按钮无对齐属性、按渲染像素折行且居中（折行会把首行「Yes」顶偏），文本硬上限 100 字符，因此按钮文案按单行预算（Mac 端估 ~72-78 字符，取 70）**词边界截断加 `…`**；放不下的完整详情左对齐补在按钮上方的正文里，编号与按钮对应。点建议行 = 全部建议原样回传 `updatedPermissions`，**由 Claude Code 原生持久化**；点 auto 行 = 回传 `setMode{auto, session}` 切换会话权限模式。终端上「switch to auto mode」选项是否出现由 CLI 运行时状态决定（账号级 gate 快照、当前模式——manual 模式不提供、熔断器），hook payload 里没有这些状态——cc-bridge 不猜：**hook 阻塞期间确认框正渲染在终端上，daemon 经 herdr 读 pane 文本取 ground truth**（`herdr agent read --source visible`，解析见 `src/dialog.mjs`），终端有这行卡片才出。会话不在 herdr pane 里（远程机器 / 普通终端）读不到时按「无」处理。
@@ -91,7 +92,7 @@ token 自动刷新（`offline_access` scope 换取 refresh_token，单次有效�
 
 获取群的 `chat_id`：先把机器人拉进群，在群里发一条「**绑定**」，daemon 会把本群 `chat_id`（和你的 `open_id`）回复给你，填进 `bindings` 后重启 serve。**没有兜底接收方**：未命中任何绑定目录的会话不发卡、不关联（确认请求直接 fail-open 回 Claude Code 本地确认）。每条 binding 必须同时配置 `chatId`（`oc_` 开头）和 `cwd`（绝对路径），配错配漏会在 serve/test 启动时报错退出。
 
-`init.sh` 内部即 `npm install` + `install-hooks` + `test`，无需单独执行；要自定义时才手动跑 `node cli.mjs install-hooks --matcher 'Bash|Write|Edit'`（自动探测：CLI 支持 PermissionRequest 则用之，否则回退 PreToolUse；PostToolUse / Stop / Notification 一并安装，用于本地作答联动与通知转发）。装完 hook 重启 Claude Code 会话即生效；日常用 `node cli.mjs status` / `rules` 查看 daemon 状态和免确认规则。
+`init.sh` 内部即 `npm install` + `install-hooks` + `test`，无需单独执行；要自定义时才手动跑 `node cli.mjs install-hooks --matcher 'Bash|Write|Edit'`（自动探测：CLI 支持 PermissionRequest 则用之，否则回退 PreToolUse；另装 `AskUserQuestion|ExitPlanMode` 的 PreToolUse/PostToolUse：计划提问与计划审批也镜像为可点按的「提问/审批卡」，点卡远程代答；PostToolUse / Stop / Notification 一并安装，用于本地作答联动与通知转发；同一事件多条 matcher 并存，重装幂等替换）。装完 hook 重启 Claude Code 会话即生效；日常用 `node cli.mjs status` / `rules` 查看 daemon 状态和免确认规则。
 
 ### 3. 其他机器接入：./connect.sh
 
@@ -113,6 +114,7 @@ daemon 机器把配置 `host` 改为 `0.0.0.0`（并设置 `token`）后 `./serv
 | `bindings` | `[]` | **「群 ↔ 目录」绑定列表**：`[{ "chatId": "oc_..", "cwd": "/repo/path", "name": "可选备注" }]`。绑定群消息免 @ 自动在该目录执行 claude；该目录（含子目录）下会话的确认/通知卡也路由到该群（多绑定目录重叠时最长前缀优先）。**每条必须同时配置 `chatId`（`oc_` 开头）与 `cwd`（绝对路径），配错配漏 serve 启动直接报错**。cwd 不在 daemon 本机时自动成为「仅路由」绑定：卡片照常路由，消息不驱动执行（用于远程机器 workspace）。无兜底接收方：未命中任何绑定的目录不发卡 |
 | `host` / `port` | `127.0.0.1` / `3757` | HTTP 监听；跨机器接入改 `0.0.0.0` |
 | `timeoutSec` | `300` | **长轮询模式**等待飞书确认的超时（无头 / 远程机器会话），上限 580。herdr pane 会话走代答模式，不受此限（卡片无寿命）。为什么长轮询有上限：Claude Code 对 hook 有 600s 硬上限（hook 侧已显式配 600s，保证 daemon 先超时优雅返回），到点 hook 被杀后仅剩终端本地确认框 |
+| `questionWatchSec` | `1800` | 提问/审批卡观察器（AskUserQuestion/ExitPlanMode）读屏轮询时长上限；到点只停轮询，已发卡片仍可点按（点按时重新读屏校验） |
 | `maxPending` | `16` | 同时挂起的确认数上限，超出直接放行走本地流程 |
 | `token` | 空 | hook 客户端与 daemon 之间的 Bearer 共享密钥（跨机器必设） |
 | `allowedOpenIds` | `[]` | 允许点按钮/发指令的飞书用户，空为不限制（**开启消息驱动建议配置**，否则绑定群里的任何人都能在你机器上跑 claude） |
@@ -136,7 +138,7 @@ daemon 机器把配置 `host` 改为 `0.0.0.0`（并设置 `token`）后 `./serv
 
 | 方法 & 路径 | 说明 |
 |---|---|
-| `POST /hook/permissionrequest` `POST /hook/pretooluse` | 确认类 hook 的 stdin JSON → 挂起等待决策；响应体即 hook stdout（空 = 无意见），按事件返回对应决策 schema |
+| `POST /hook/permissionrequest` `POST /hook/pretooluse` | 确认类 hook 的 stdin JSON → 挂起等待决策；响应体即 hook stdout（空 = 无意见），按事件返回对应决策 schema。`pretooluse` 收到 `AskUserQuestion`/`ExitPlanMode` 时**立即空体放行**并转入读屏观察发提问/审批卡（不阻塞） |
 | `POST /hook/posttooluse` | 工具已执行 → 严格匹配（会话+工具+参数）结算对应挂起确认，卡片刷为「已在终端允许」；本身不挂起、不发卡 |
 | `POST /hook/notification` | 转通知卡片 |
 | `POST /hook/stop` | 回合结束 → 该会话挂起确认结算为「已在终端处理」；读得到本回合最终输出时另发「🏁 已完成」结果卡（串在来源消息下；`notifyStop: false` 关闭） |
@@ -171,6 +173,8 @@ systemctl --user disable --now cc-bridge 2>/dev/null || true   # 停用 systemd 
 - **绑定群里发消息没反应**：先确认群在 `bindings` 里且已重启 serve（`node cli.mjs status` 可看绑定数）；再检查应用权限——没有「获取群组中所有消息」（`im:message.group_msg`）权限时飞书不会把未 @ 的群消息推给应用，此时群里须 @机器人 触发（开「获取群组中@机器人消息」`im:message.group_at_msg` 即可）；单聊不驱动执行（绑定以群为单位）。
 - **消息驱动在哪台机器/目录跑**：在 daemon 所在机器、该群 `bindings` 里绑定的 `cwd` 下执行，和终端里在该目录开 claude 一致；权限确认照常弹卡片，且路由回该群。
 - **pane 里的 claude 退出/崩溃了，人不在终端**：绑定群发 `/restart`——在绑定目录下找已退出的 pane 重新拉起 claude（默认 `--continue` 恢复该目录最近一条会话；同目录有多条会话时可能恢复到别的，介意就回终端 `claude --resume <sid>`）。`/restart new` 全新会话；`/sessions` 也会列出已退出的 pane。无头会话线不受影响（下一条消息自动新开）。
+- **会话卡在选择题/计划审批框上（plan 模式提问、"Would you like to proceed?"）**：这些不触发权限确认 hook，cc-bridge 单独装了 `AskUserQuestion|ExitPlanMode` 的 PreToolUse/PostToolUse hook——终端出选择题的同时群里会出现「❓ 提问卡 / 📋 计划待审批」，点选项即在终端代答（多选题先勾选再「确认提交」；审批卡三键对应 auto 批准 / 手动批准 / 不批回计划模式）。升级 cc-bridge 后记得重跑 `node cli.mjs install-hooks`（旧 settings.json 里没有这两条）。
+- **哪些阻塞框仍不会远程发卡**：① 目录信任确认（首次打开目录的 trust 对话框）发生在 agent 就绪前、无任何 hook 触发，且属安全决策——**故意不远程代答**，需回终端处理；② auto-compact（上下文压缩确认）在当前 CLI 版本默认自动执行、无 hook；③ MCP OAuth 授权弹窗无 hook 触发。这三类只能回终端，其余确认/提问/审批均已被卡片接管。
 - **daemon 挂了怎么办**：serve.sh 走 systemd 时崩溃约 3s 自动拉起（`node cli.mjs status` 验证）；期间终端本地操作完全不受影响（fail-open），只是手机收不到卡。
 
 ## 设计说明
@@ -181,6 +185,7 @@ systemctl --user disable --now cc-bridge 2>/dev/null || true   # 停用 systemd 
 - **选项读屏对齐**：auto 模式行等 UI 自加选项不出现在 `permission_suggestions` 里，可见性还取决于账号 gate / 当前模式 / 熔断器等运行时状态（同一会话同一模型也会变），从 payload 推不出来。daemon 发卡前用 `herdr agent read` 抓终端当前渲染的确认框文本（hook 阻塞期间对话框就显示在 pane 上），解析「Do you want…」锚点后的编号选项行（折行合并、Tip 提示行不误判）决定卡片按钮集，保证两边一一对应。
 - **顺序与超时对齐**：hook 配置 `timeout: 600` > daemon `timeoutSec`（≤580）> hook 客户端自毁（`timeoutSec`+15s，上限 590s），保证先由 daemon 超时优雅返回、Claude Code 不会先杀 hook。hook 客户端用 **node:http** 而非全局 fetch：Node fetch（undici）自带默认 300s 响应头超时（headersTimeout），长轮询恰好 300s 被掐断——曾导致确认卡一律 300s 翻灰「客户端断开」，`timeoutSec` 配多大都无效；node:http 无默认响应超时，等待窗口完全由配置决定。
 - **代答模式的安全闭环**：往 pane 发键可能误伤（框刚被本地答掉时 `Enter` 会落进输入框、`Esc` 会打断回合），因此绝不盲发——点卡后先读屏验框（框不在 → 翻「已在终端处理」），选项与卡片逐字比对（对不上 → 翻「确认框已变化，请在终端处理」，一个键都不发），发键后隔 500/800ms 两拍复验框消失才认成功（仍在 → 同样翻「确认框已变化」，不硬猜结果）。代答进行中置 `answering` 标记：按键放行引发的 PostToolUse 不会把卡片抢答成「已在终端允许」。旧代答卡有三条回收路径：PostToolUse（本地允许）、Stop（回合结束兜底）、同会话新确认到达时读屏清扫（本地 Esc 拒绝无事件信号的场景）。
+- **选择题对话框解析**（`src/dialog.mjs`）：AskUserQuestion 与权限确认框共用「编号选项」视觉但锚点互斥——选择框页脚是 `Enter to select`、权限框页脚是 `Esc to cancel · Tab to amend`；ExitPlanMode 锚定 `Would you like to proceed?` 问句。选项行支持 ❯ 光标与 ☐/☒ 多选勾选符、说明折行并入上方选项、`3. Type something.` / `4. Chat about this` 元选项行（由 hook payload 配对剥除，不给它们出按钮）；问题文本归一化为卡片 key，点卡时逐字复验防串题。多问题逐题渲染 → 逐题发卡；复审框（Ready to submit your answers?）在答案全部经卡片代答时自动提交，终端答的照常发卡由人点。
 - 决策 schema 按事件区分（均已对照官方 hooks 文档核实）：`PreToolUse` 返回 `hookSpecificOutput.permissionDecision`（allow/deny）；`PermissionRequest` 返回 `hookSpecificOutput.decision.behavior`（allow/deny），`deny` 的原因/消息会反馈给 Claude，建议行/auto 行通过 `decision.updatedPermissions`（数组）回传原生权限更新（addRules / setMode 等，字段见 hooks 文档「Permission update entries」）。
 - 挂起请求用 HTTP 长轮询实现，hook 进程无需额外状态；同一卡片重复回调按 rid 幂等处理。
 - **双向防环（三层）**：镜像与注入打通后消息可能在「群 → CLI → 群 → CLI …」无限往返——① 以本人身份镜像出去的消息会真实触发 receive 事件，其 message_id 登记 30 分钟，入站命中直接丢弃；② daemon 注入会话的 prompt（sid+内容哈希，5 分钟）在 UserPromptSubmit 上报时命中则不再镜像；③ 断路器兜底：同群同内容 60s 内 ≥3 次即判定疑似回环，丢弃后续并告警一次。所有条目带 TTL 惰性清扫，无定时器。

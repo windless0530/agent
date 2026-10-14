@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createBridge } from '../src/server.mjs';
-import { parseDialogOptions, dialogHasAutoRow } from '../src/dialog.mjs';
+import { parseDialogOptions, dialogHasAutoRow, parseChoiceDialog } from '../src/dialog.mjs';
 import { loadConfig, validateServeConfig } from '../src/config.mjs';
 import { createChatRunner, extractText } from '../src/agent.mjs';
 import {
@@ -14,6 +14,7 @@ import {
   summarizeTool,
   buildTaskResultCard,
 } from '../src/cards.mjs';
+import { buildHookCommands, installHooks, removeHooks, DEFAULT_MATCHER, QUESTION_MATCHER } from '../src/install.mjs';
 import { waitFor } from '../src/util.mjs';
 
 /** 假 messenger：记录发送与更新，不访问飞书（无 peer 通道，只有定向发送） */
@@ -1071,6 +1072,471 @@ test('代答模式：终端选项与卡片不一致 / 复验框仍在 → 不硬
   }
 });
 
+// ---------- 选择题 / 计划审批卡（AskUserQuestion / ExitPlanMode） ----------
+
+/** 实抓样本（herdr 读屏带 CLI 右边框 │），单问题 + 元选项行（3. Type something.） */
+const CHOICE_Q1 = `──────────────────────────────────────────────────────────│
+Planning: /home/ubuntu/.claude/plans/snazzy-skipping-giraffe.md│
+──────────────────────────────────────────────────────────│
+←  ☐ 高亮语义  ☐ 选择范围  ☐ 持久化  ✔ Submit  →           │
+                                                           │
+地图上「被选族群的区域」如何判定？                          │
+                                                           │
+  1. 任一被选族群在场即点亮 (Recommended)                   │
+     被选族群在该区域当年存在（含非主族群）即点亮           │
+❯ 2. 仅主族群点亮                                           │
+     只点亮被选族群为该区域主族群（着色者）的几何           │
+  3. Type something.                                        │
+──────────────────────────────────────────────────────────│
+  4. Chat about this                                        │
+                                                           │
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel│`;
+
+/** 第二题（光标在第 1 项） */
+const CHOICE_Q2 = `树上的多选粒度？                                          │
+                                                           │
+❯ 1. 叶级 + 分支整支选择 (Recommended)                     │
+  2. 仅叶级多选                                            │
+  3. Type something.                                       │
+──────────────────────────────────────────────────────────│
+  4. Chat about this                                       │
+                                                           │
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel│`;
+
+/** 复审框（全部作答后出现；Submit answers / Cancel） */
+const CHOICE_REVIEW = `Review your answers                                       │
+                                                           │
+ ● 地图上「被选族群的区域」如何判定？                       │
+   → 仅主族群点亮                                          │
+ ● 树上的多选粒度？                                        │
+   → 叶级 + 分支整支选择 (Recommended)                     │
+                                                           │
+Ready to submit your answers?                              │
+                                                           │
+❯ 1. Submit answers                                        │
+  2. Cancel                                                │
+                                                           │
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel│`;
+
+/** ExitPlanMode 审批框 */
+const CHOICE_PLAN = `Claude has written up a plan and is ready to execute. Would you like to proceed?│
+                                                           │
+ ❯ 1. Yes, and use auto mode                               │
+   2. Yes, manually approve edits                          │
+   3. Tell Claude what to change                           │
+      shift+tab to approve with this feedback              │
+                                                           │
+  ctrl+g to edit in Vim · ~/.claude/plans/snazzy-skipping-giraffe.md│`;
+
+/** 找到指定 act（可选 opt）的按钮并返回其 value */
+function qBtn(card, act, opt) {
+  const btn = card.body.elements.find(
+    (e) => e.tag === 'button' && e.behaviors?.[0]?.value?.act === act && (opt === undefined || e.behaviors[0].value.opt === opt),
+  );
+  return btn?.behaviors[0].value || null;
+}
+
+test('parseChoiceDialog：真实样本（提问/复审/计划审批）逐项解析；权限确认框不误判', () => {
+  const q1 = parseChoiceDialog(CHOICE_Q1);
+  assert.ok(q1, 'Q1 应识别为选择题');
+  assert.equal(q1.kind, 'question');
+  assert.equal(q1.question, '地图上「被选族群的区域」如何判定？');
+  assert.deepEqual(
+    q1.options.map((o) => o.n),
+    [1, 2, 3, 4],
+  );
+  assert.equal(q1.options[0].label, '任一被选族群在场即点亮 (Recommended)');
+  assert.ok(q1.options[0].desc.includes('非主族群'), '说明行应并入其上方选项');
+  assert.equal(q1.options.find((o) => o.cursor).n, 2, '❯ 光标在第 2 项');
+  assert.ok(!q1.options.some((o) => o.checked !== undefined), '单选无勾选态');
+
+  const review = parseChoiceDialog(CHOICE_REVIEW);
+  assert.equal(review.kind, 'review');
+  assert.match(review.question, /ready to submit your answers\?/i);
+  assert.equal(review.options.length, 2);
+
+  const plan = parseChoiceDialog(CHOICE_PLAN);
+  assert.equal(plan.kind, 'plan');
+  assert.match(plan.question, /Would you like to proceed\?/);
+  assert.equal(plan.options.length, 3);
+  assert.equal(plan.options.find((o) => o.cursor).n, 1);
+  assert.ok(plan.options[2].desc.includes('shift+tab'), '折行说明并入选项');
+
+  // 权限确认框（"Do you want" + Yes/No + Esc to cancel 页脚）不得误判为选择题
+  assert.equal(parseChoiceDialog(DIALOG_3OPT), null);
+  assert.equal(parseChoiceDialog('❯ 随便一段终端输出\n没有对话框'), null);
+  assert.equal(parseChoiceDialog(''), null);
+
+  // prose 误判（实测踩坑：pane 正在编辑 README/diff，文档本身引用了锚点文案）：
+  // 只引用 "Would you like to proceed?" 的说明文字 + 下方恰好有编号行 → 不是审批框
+  const prose = [
+    '┌ Changes ┐',
+    '61 + ExitPlanMode 锚定 `Would you like to proceed?` 问句，选项行支持 ❯ 光标',
+    '62 + 1. 先做 A',
+    '63 + 2. 再做 B',
+    '',
+  ].join('\n');
+  assert.equal(parseChoiceDialog(prose), null, '文档引用锚点文案不误判');
+  // 锚点在 pane 中上部（底部 45 行窗口外）→ 过期/历史输出，不认
+  assert.equal(parseChoiceDialog(CHOICE_Q1 + '\n'.repeat(0) + '输出\n'.repeat(50)), null, '对话框下方还有 50 行输出 = 过期框');
+  // 中部出现 "Enter to select" 引用 + 底部无真实页脚 → 不认
+  const prose2 = 'README：页脚是 `Enter to select · Tab/Arrow keys to navigate · Esc to cancel`\n' + '正文\n'.repeat(50);
+  assert.equal(parseChoiceDialog(prose2), null);
+
+  // 分栏视图（实测：CLI 侧边 diff/预览面板与对话框同行渲染，│ 之后是右栏文本）
+  const split = CHOICE_Q1.split('\n')
+    .map((l, i) => (l.endsWith('│') ? `${l.slice(0, -1)}│ 25  ${(i + 1) * 7} 右栏文本 ${i}` : l))
+    .join('\n');
+  const sq = parseChoiceDialog(split);
+  assert.ok(sq, '分栏视图仍能识别');
+  assert.equal(sq.question, '地图上「被选族群的区域」如何判定？', '问题不带右栏垃圾');
+  assert.ok(!sq.options[0].label.includes('右栏'), '选项 label 不带右栏垃圾');
+  assert.equal(sq.options.find((o) => o.cursor).n, 2, '光标识别不受影响');
+});
+
+const QUESTION_PAYLOAD_Q1 = {
+  header: '高亮语义',
+  multiSelect: false,
+  question: '地图上「被选族群的区域」如何判定？',
+  options: [
+    { label: '任一被选族群在场即点亮 (Recommended)', description: '被选族群在该区域当年存在（含非主族群）即点亮' },
+    { label: '仅主族群点亮', description: '只点亮被选族群为该区域主族群（着色者）的几何' },
+  ],
+};
+const QUESTION_PAYLOAD_Q2 = {
+  header: '选择范围',
+  multiSelect: false,
+  question: '树上的多选粒度？',
+  options: [
+    { label: '叶级 + 分支整支选择 (Recommended)', description: '点分支行一键全选/全清' },
+    { label: '仅叶级多选', description: '只有族群行可勾选' },
+  ],
+};
+
+/**
+ * 模拟「按键驱动终端前进」的 keySender：Enter 提交当前题 → 屏上换下一题
+ * （Q1→Q2→复审→空），Escape → 框消失。paneReader 恒读当前 screen，
+ * 与真实终端一致：状态因我们发的键而变，点卡前的读屏看到的是按键前的框。
+ */
+function makeQuestionTerm() {
+  const term = {
+    screen: CHOICE_Q1,
+    keys: [],
+    async sender(paneId, key) {
+      term.keys.push({ paneId, key });
+      if (key === 'Enter') {
+        if (term.screen === CHOICE_Q1) term.screen = CHOICE_Q2;
+        else if (term.screen === CHOICE_Q2) term.screen = CHOICE_REVIEW;
+        else term.screen = '';
+      } else if (key === 'Escape') {
+        term.screen = '';
+      }
+      return true;
+    },
+    reader() {
+      return term.screen;
+    },
+  };
+  return term;
+}
+
+test('提问卡：hook 立即放行 → 逐题发卡 → 点卡代答（Up/Down+Enter）→ 复审框自动提交', async () => {
+  const term = makeQuestionTerm();
+  const t = await startBridge({ timeoutSec: 30 }, async () => term.reader(), {
+    paneResolver: async () => 'w9:p1',
+    keySender: term.sender,
+  });
+  try {
+    const res = await post(t.base, '/hook/pretooluse', {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [QUESTION_PAYLOAD_Q1, QUESTION_PAYLOAD_Q2] },
+      cwd: '/home/user/project',
+      session_id: 'sess-qz',
+    });
+    assert.equal((await res.text()).trim(), '', 'hook 立即空体放行');
+    await waitFor(() => t.messenger.sent.length === 1);
+    const card1 = t.messenger.sent[0];
+    assert.equal(card1.header.title.content, '❓ Claude 提问');
+    assert.equal(card1.header.subtitle.content, '高亮语义', '副标题用 payload 的 header');
+    // payload 只有 2 个真实选项：元选项行（3. Type something / 4. Chat about）不出按钮
+    const optBtns = card1.body.elements.filter((e) => e.tag === 'button' && e.behaviors[0].value.act === 'q-opt');
+    assert.equal(optBtns.length, 2);
+    assert.equal(t.bridge.pendingSize(), 1);
+
+    // 点选项 1：光标在第 2 项、目标在其上方 → Up+Enter；Enter 后屏上换到第 2 题 → 卡翻绿
+    await t.bridge.handleCardAction({
+      action: { value: { ...qBtn(card1, 'q-opt', 1), act: 'q-opt', opt: 1 } },
+      operator: { open_id: 'ou_u', name: '李四' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(term.keys, [
+      { paneId: 'w9:p1', key: 'Up' },
+      { paneId: 'w9:p1', key: 'Enter' },
+    ]);
+    assert.equal(t.messenger.updates[0].card.header.title.content, '✅ 已代答');
+    assert.match(t.messenger.updates[0].card.body.elements[0].content, /任一被选族群在场即点亮/);
+    assert.match(t.messenger.updates[0].card.body.elements[0].content, /李四/, '结果卡带操作人');
+
+    // 观察器继续轮询 → 第 2 题发新卡（header 来自 payload 配对）
+    await waitFor(() => t.messenger.sent.length === 2);
+    assert.equal(t.messenger.sent[1].header.subtitle.content, '选择范围');
+
+    // 点选项 2：光标在第 1 项、目标在其下方 → Down+Enter；Enter 后屏上换复审框
+    await t.bridge.handleCardAction({
+      action: { value: { ...qBtn(t.messenger.sent[1], 'q-opt', 2), act: 'q-opt', opt: 2 } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 2);
+    assert.deepEqual(
+      term.keys.map((k) => k.key),
+      ['Up', 'Enter', 'Down', 'Enter'],
+    );
+
+    // 复审框：两题都已卡片代答 → 观察器自动提交（Enter），不为复审框发卡
+    await waitFor(() => term.keys.length === 5, { timeoutMs: 8000 });
+    assert.equal(term.keys[4].key, 'Enter', '复审框自动提交');
+    // PostToolUse 带回答案：观察器停止、无挂起残留、无新增卡片
+    await post(t.base, '/hook/posttooluse', {
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [QUESTION_PAYLOAD_Q1, QUESTION_PAYLOAD_Q2] },
+      tool_response: {
+        content:
+          'Your questions have been answered: "地图上「被选族群的区域」如何判定？"="任一被选族群在场即点亮 (Recommended)", "树上的多选粒度？"="仅叶级多选". You can now continue with these answers in mind.',
+      },
+      session_id: 'sess-qz',
+    });
+    await waitFor(() => t.bridge.pendingSize() === 0);
+    assert.equal(t.messenger.sent.length, 2, '复审框自动提交后未另发卡');
+    assert.deepEqual(t.bridge.watcherCount(), [], 'PostToolUse 后观察器已停');
+  } finally {
+    t.bridge.stopWatchers();
+    await t.close();
+  }
+});
+
+test('提问卡：点卡时框已不在/问题对不上 → 不硬按；终端先答 → PostToolUse 带答案收尾', async () => {
+  let screen = CHOICE_Q1;
+  const keys = [];
+  const t = await startBridge({ timeoutSec: 30 }, async () => screen, {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => (keys.push({ paneId, key }), true),
+  });
+  try {
+    // 1) 框已不在（终端本地已答）→ 翻「已在终端处理」
+    await post(t.base, '/hook/pretooluse', {
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [QUESTION_PAYLOAD_Q1] },
+      cwd: '/home/user/project',
+      session_id: 'sess-qz2',
+    });
+    await waitFor(() => t.messenger.sent.length === 1);
+    screen = '';
+    const card = t.messenger.sent[0];
+    await t.bridge.handleCardAction({
+      action: { value: { ...qBtn(card, 'q-opt', 1), act: 'q-opt', opt: 1 } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(keys, []);
+    assert.match(t.messenger.updates[0].card.header.title.content, /已在终端处理/);
+
+    // 2) 卡片已过期：屏上已换到下一题（key 对不上）→ 不硬按，翻「选择框已变化」
+    screen = CHOICE_Q1;
+    await post(t.base, '/hook/pretooluse', {
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [QUESTION_PAYLOAD_Q1] },
+      cwd: '/home/user/project',
+      session_id: 'sess-qz3',
+    });
+    await waitFor(() => t.messenger.sent.length === 2);
+    screen = CHOICE_Q2; // 卡发出后终端自己推进到了下一题
+    await t.bridge.handleCardAction({
+      action: { value: { ...qBtn(t.messenger.sent[1], 'q-opt', 1), act: 'q-opt', opt: 1 } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 2);
+    assert.deepEqual(keys, [], '问题对不上不发任何键');
+    assert.match(t.messenger.updates[1].card.header.title.content, /选择框已变化/);
+
+    // 3) 终端自己答完：PostToolUse 带答案 → 卡翻「已作答」并显示答案
+    await post(t.base, '/hook/pretooluse', {
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [QUESTION_PAYLOAD_Q2] },
+      cwd: '/home/user/project',
+      session_id: 'sess-qz4',
+    });
+    await waitFor(() => t.messenger.sent.length === 3);
+    assert.equal(t.bridge.pendingSize(), 1);
+    await post(t.base, '/hook/posttooluse', {
+      tool_name: 'AskUserQuestion',
+      tool_response: { content: 'Your questions have been answered: "树上的多选粒度？"="仅叶级多选".' },
+      session_id: 'sess-qz4',
+    });
+    await waitFor(() => t.messenger.updates.length === 3);
+    assert.match(t.messenger.updates[2].card.header.title.content, /已作答/);
+    assert.match(t.messenger.updates[2].card.body.elements[0].content, /仅叶级多选/);
+    assert.equal(t.bridge.pendingSize(), 0);
+  } finally {
+    t.bridge.stopWatchers();
+    await t.close();
+  }
+});
+
+test('计划审批卡：ExitPlanMode → 计划入卡 → 批准/取消代答；PostToolUse 感知已批准', async () => {
+  let screen = CHOICE_PLAN;
+  const keys = [];
+  const t = await startBridge({ timeoutSec: 30 }, async () => screen, {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => {
+      keys.push({ paneId, key });
+      if (key === 'Enter' || key === 'Escape') screen = ''; // 选定/取消后审批框消失
+      return true;
+    },
+  });
+  try {
+    await post(t.base, '/hook/pretooluse', {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'ExitPlanMode',
+      tool_input: { plan: '# 计划标题\n\n步骤一…', planFilePath: '/home/x/.claude/plans/p.md' },
+      cwd: '/home/user/project',
+      session_id: 'sess-pl',
+    });
+    await waitFor(() => t.messenger.sent.length === 1);
+    const card = t.messenger.sent[0];
+    assert.equal(card.header.title.content, '📋 计划待审批');
+    assert.match(card.body.elements[0].content, /计划标题/);
+    assert.match(card.body.elements[0].content, /p\.md/);
+    const acts = card.body.elements
+      .filter((e) => e.tag === 'button')
+      .map((b) => b.behaviors[0].value.act);
+    assert.deepEqual(acts, ['q-opt', 'q-opt', 'q-deny']);
+    assert.equal(t.bridge.pendingSize(), 1);
+
+    // 批准（选项 1，光标已在 1）→ 仅 Enter；框消失 → 卡翻绿
+    await t.bridge.handleCardAction({
+      action: { value: { ...qBtn(card, 'q-opt', 1), act: 'q-opt', opt: 1 } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(keys, [{ paneId: 'w9:p1', key: 'Enter' }]);
+    assert.equal(t.messenger.updates[0].card.header.title.content, '✅ 已代答');
+    assert.match(t.messenger.updates[0].card.body.elements[0].content, /Yes, and use auto mode/);
+
+    // 取消路径：另发一卡，点 q-deny → Esc → 框消失 → 卡翻灰
+    screen = CHOICE_PLAN;
+    await post(t.base, '/hook/pretooluse', {
+      tool_name: 'ExitPlanMode',
+      tool_input: { plan: '# 又一份计划' },
+      cwd: '/home/user/project',
+      session_id: 'sess-pl2',
+    });
+    await waitFor(() => t.messenger.sent.length === 2);
+    await t.bridge.handleCardAction({
+      action: { value: { ...qBtn(t.messenger.sent[1], 'q-deny'), act: 'q-deny' } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 2);
+    assert.deepEqual(
+      keys.map((k) => k.key),
+      ['Enter', 'Escape'],
+    );
+    assert.match(t.messenger.updates[1].card.header.title.content, /已取消/);
+    assert.match(t.messenger.updates[1].card.body.elements[0].content, /修改意见可直接发到本群/);
+
+    // 终端自己批准：PostToolUse → 卡翻「已作答（计划已批准）」
+    screen = CHOICE_PLAN;
+    await post(t.base, '/hook/pretooluse', {
+      tool_name: 'ExitPlanMode',
+      tool_input: { plan: '# 第三份计划' },
+      cwd: '/home/user/project',
+      session_id: 'sess-pl3',
+    });
+    await waitFor(() => t.messenger.sent.length === 3);
+    await post(t.base, '/hook/posttooluse', {
+      tool_name: 'ExitPlanMode',
+      tool_response: { content: 'User has approved your plan. You can now start coding.' },
+      session_id: 'sess-pl3',
+    });
+    await waitFor(() => t.messenger.updates.length === 3);
+    assert.match(t.messenger.updates[2].card.body.elements[0].content, /计划已批准/);
+    assert.equal(t.bridge.pendingSize(), 0);
+  } finally {
+    t.bridge.stopWatchers();
+    await t.close();
+  }
+});
+
+test('提问卡挂着时 idle_prompt 通知被抑制；多选题勾选/提交流程', async () => {
+  let screen = CHOICE_Q1; // 多选勾选（Space）不关框；Enter 提交后框消失
+  const keys = [];
+  const t = await startBridge({ timeoutSec: 30 }, async () => screen, {
+    paneResolver: async () => 'w9:p1',
+    keySender: async (paneId, key) => {
+      keys.push({ paneId, key });
+      if (key === 'Enter') screen = '';
+      return true;
+    },
+  });
+  try {
+    await post(t.base, '/hook/pretooluse', {
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ ...QUESTION_PAYLOAD_Q1, multiSelect: true }] },
+      cwd: '/home/user/project',
+      session_id: 'sess-qm',
+    });
+    await waitFor(() => t.messenger.sent.length === 1);
+    const card = t.messenger.sent[0];
+    // multiSelect → 勾选按钮 + 提交按钮
+    assert.ok(qBtn(card, 'q-toggle', 1) && qBtn(card, 'q-toggle', 2), '多选出勾选按钮');
+    assert.ok(qBtn(card, 'q-submit'), '多选出提交按钮');
+
+    // 提问卡挂着 → idle_prompt 通知被抑制
+    await post(t.base, '/hook/notification', {
+      notification_type: 'idle_prompt',
+      message: 'Claude is waiting for your input',
+      cwd: '/home/user/project',
+      session_id: 'sess-qm',
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(t.messenger.sent.length, 1, '空闲通知不发卡');
+
+    // 勾选 1：光标在第 2 项，目标在其上方 1 行 → Up+Space；框不关 → 卡重绘为 ☑、保持可点
+    await t.bridge.handleCardAction({
+      action: { value: { ...qBtn(card, 'q-toggle', 1), act: 'q-toggle', opt: 1 } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 1);
+    assert.deepEqual(
+      keys.map((k) => k.key),
+      ['Up', 'Space'],
+    );
+    assert.match(
+      t.messenger.updates[0].card.body.elements.find((e) => e.tag === 'button' && e.behaviors[0].value.act === 'q-submit').text.content,
+      /已选 1/,
+    );
+    assert.match(
+      t.messenger.updates[0].card.body.elements.find((e) => e.tag === 'button' && e.behaviors[0].value.act === 'q-toggle' && e.behaviors[0].value.opt === 1).text.content,
+      /☑/,
+      '勾选后按钮带 ☑ 标记',
+    );
+    assert.equal(t.bridge.pendingSize(), 1, '勾选后卡片保持可点（不结算）');
+
+    // 提交（Enter）→ 框消失 → 翻绿，所选为勾选项
+    await t.bridge.handleCardAction({
+      action: { value: { ...qBtn(t.messenger.updates[0].card, 'q-submit'), act: 'q-submit' } },
+      operator: { open_id: 'ou_u' },
+    });
+    await waitFor(() => t.messenger.updates.length === 2);
+    assert.equal(keys.at(-1).key, 'Enter');
+    assert.match(t.messenger.updates[1].card.body.elements[0].content, /任一被选族群在场即点亮/);
+    assert.equal(t.bridge.pendingSize(), 0);
+  } finally {
+    t.bridge.stopWatchers();
+    await t.close();
+  }
+});
+
 test('代答模式：PostToolUse 本地结算照常翻卡；新确认到达时旧代答卡被清扫', async () => {
   const keys = [];
   const t = await startBridge({ timeoutSec: 30 }, async () => '', {
@@ -1260,6 +1726,62 @@ test('bindings 校验：配错配漏直接报错，不静默丢弃', () => {
   // 一个 binding 都没配也是配置错误（无兜底接收方）
   const empty = validateServeConfig(loadConfig({ __configFile: '/nonexistent.cc-bridge.json' }));
   assert.ok(empty.some((e) => /bindings 未配置/.test(e)));
+});
+
+test('installHooks：同事件多 matcher 分组写入（确认 + 选择题），幂等替换且不动他人条目', () => {
+  const url = 'http://127.0.0.1:3757';
+  const cmds = buildHookCommands({ cliPath: '/x/cli.mjs', url, token: 'tk' });
+  // 7 条：确认（PermissionRequest 或 PreToolUse）+ 选择题 Pre/Post + 确认 Post + Notification + Stop + UserPromptSubmit
+  assert.equal(cmds.length, 7);
+  const pre = cmds.filter((c) => c.event === 'PreToolUse');
+  assert.equal(pre.length, 2, 'PreToolUse 有确认与选择题两条');
+  assert.ok(pre.some((c) => c.matcher === DEFAULT_MATCHER && /hook\/pretooluse/.test(c.command)));
+  assert.ok(pre.some((c) => c.matcher === QUESTION_MATCHER && c.matcher.includes('ExitPlanMode')));
+  const post = cmds.filter((c) => c.event === 'PostToolUse');
+  assert.equal(post.length, 2);
+  assert.ok(cmds.some((c) => c.event === 'UserPromptSubmit' && c.timeout === 10));
+
+  // 落盘：预置一条别人的 hook + 一条旧版 cc-bridge 条目 → 别人的保留、我们的整体替换
+  const file = path.join(os.tmpdir(), `cc-bridge-test-settings-${Date.now()}.json`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      model: 'sonnet',
+      hooks: {
+        PreToolUse: [{ matcher: '^MyTool$', hooks: [{ type: 'command', command: 'echo mine' }] }],
+        Stop: [{ hooks: [{ type: 'command', command: `${url}/hook/stop` }] }], // 旧 cc-bridge 条目（无 matcher）
+      },
+    }),
+    'utf8',
+  );
+  try {
+    const { plan } = installHooks({ file, commands: cmds });
+    assert.equal(plan.filter((p) => p.event === 'PreToolUse').length, 2);
+    const settings = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+    const pre1 = settings().hooks.PreToolUse;
+    assert.equal(pre1.length, 3, '别人 1 条 + 我们 2 条');
+    assert.ok(pre1.some((e) => e.matcher === '^MyTool$'));
+    assert.deepEqual(
+      pre1.filter((e) => e.matcher === QUESTION_MATCHER).length,
+      1,
+      '选择题 matcher 独立成条',
+    );
+    assert.equal(settings().hooks.Stop.length, 1, '旧 Stop 条目被 ours 替换为新的（不叠加）');
+    assert.equal(settings().model, 'sonnet', '其余配置字段不动');
+
+    // 幂等：再装一次结构不变
+    installHooks({ file, commands: cmds });
+    assert.equal(settings().hooks.PreToolUse.length, 3);
+
+    // 卸载：我们的全删，别人的全留
+    removeHooks({ file });
+    const after = settings().hooks;
+    assert.deepEqual(after.PreToolUse, [{ matcher: '^MyTool$', hooks: [{ type: 'command', command: 'echo mine' }] }]);
+    assert.ok(!after.Stop, 'Stop 只剩我们的 → 事件键整个删除');
+  } finally {
+    fs.rmSync(file, { force: true });
+    fs.rmSync(`${file}.bak-cc-bridge`, { force: true });
+  }
 });
 
 // ---------- 消息驱动 Claude Code（bindings：群 ↔ 目录） ----------
@@ -1830,21 +2352,21 @@ test('注入：默认注入最近活跃会话；busy 立即 ctrl+enter / 排队�
   assert.equal(herd.prompts[2].text, '稍后再优化');
   assert.equal(herd.keys.length, 1, '排队前缀不打断，keys 不新增');
 
-  // blocked：目标会话卡在确认框 → 拒绝注入；提示按确认卡死活分流（确认卡还挂着 → 指引点卡）
+  // blocked：目标会话卡在确认/提问框 → 拒绝注入；提示按卡片死活分流（卡还挂着 → 指引点卡）
   agents[0].agent_status = 'blocked';
   runner.setPendingProbe(() => true);
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '再来一条', messageId: 'om_inj_3' }));
   await waitFor(() => messenger.texts.length === 1);
-  assert.match(messenger.texts[0].text, /等待权限确认/);
-  assert.match(messenger.texts[0].text, /先处理群里的确认卡/);
+  assert.match(messenger.texts[0].text, /等待交互确认/);
+  assert.match(messenger.texts[0].text, /先处理群里的卡片（确认\/提问）/);
   // 确认卡已超时翻灰（hook 早被收走）→ 指引回终端，远程无法代答
   runner.setPendingProbe(() => false);
   await runner.handleMessage(msgEvent({ chatType: 'group', text: '又一条', messageId: 'om_inj_4' }));
   await waitFor(() => messenger.texts.length === 2);
-  assert.match(messenger.texts[1].text, /等待权限确认/);
+  assert.match(messenger.texts[1].text, /等待交互确认/);
   assert.match(messenger.texts[1].text, /已超时失效/);
   assert.match(messenger.texts[1].text, /回终端/);
-  assert.doesNotMatch(messenger.texts[1].text, /先处理群里的确认卡/);
+  assert.doesNotMatch(messenger.texts[1].text, /先处理群里的卡片/);
   agents[0].agent_status = 'idle';
 
   // /sessions 列出会话

@@ -51,6 +51,8 @@ const HELP = `cc-bridge — 把 Claude Code 的确认/授权请求转发到飞�
                                           旧 CLI 回退 PreToolUse
       （PostToolUse / Stop / Notification 一并安装：终端本地作答后把
         飞书卡片刷成「已在终端处理」，任务完成通知默认关闭，见 notifyStop）
+      （另装 AskUserQuestion|ExitPlanMode 的 PreToolUse/PostToolUse：计划提问与
+        计划审批也镜像为可点按的「提问/审批卡」，点卡远程代答）
       [--url URL --token T]               远程模式：写入 curl 形式命令
       [--remove] [--dry-run]
   cc-bridge hook <event> [--url U] [--token T]   hook 进程入口（stdin/stdout 协议）
@@ -217,6 +219,7 @@ async function cmdInstallHooks(flags) {
     url: remote ? explicitUrl : undefined,
     token: flags.token || cfg.token,
     confirmEvent,
+    matcher: flags.matcher || DEFAULT_MATCHER,
   });
   const r = installHooks({
     file,

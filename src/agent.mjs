@@ -429,16 +429,16 @@ export function createChatRunner({
     const sid = target.agent_session?.value || '';
     const r = await herd.promptAgent(target.pane_id, body);
     if (r.blocked) {
-      // 指引按确认卡的死活给：还挂着 → 点卡即可；已超时翻灰（hook 早被 Claude Code
-      // 收走，只剩终端本地确认框）→ 远程无法代答，只能回终端处理
+      // 指引按卡片的死活给：还挂着（确认/提问/审批卡）→ 点卡即可；都不在（hook 早被
+      // Claude Code 收走或观察未启动）→ 远程无法代答，只能回终端处理
       const live = sid && pendingProbe ? pendingProbe(sid) : false;
       const hint = live
-        ? '先处理群里的确认卡'
-        : '确认卡已超时失效，远程无法代答，需回终端处理';
+        ? '先处理群里的卡片（确认/提问）'
+        : '卡片已超时失效，远程无法代答，需回终端处理';
       await messenger
-        .replyText(chatId, `⛔ 目标会话正在等待权限确认（${hint}），本条未注入，稍后重发。`)
+        .replyText(chatId, `⛔ 目标会话正在等待交互确认（${hint}），本条未注入，稍后重发。`)
         .catch(() => {});
-      log('inject', `blocked pane=${target.pane_id}（确认卡${live ? '在挂' : '已失效'}），未注入`);
+      log('inject', `blocked pane=${target.pane_id}（卡片${live ? '在挂' : '已失效'}），未注入`);
       return true;
     }
     if (!r.ok) {

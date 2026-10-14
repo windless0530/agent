@@ -15,6 +15,9 @@ export const DEFAULTS = {
   port: 3757,
   /** 每个确认请求等待飞书响应的最长秒数（Claude Code hook 上限 600s） */
   timeoutSec: 300,
+  /** 选择题/计划审批观察器（AskUserQuestion/ExitPlanMode）的读屏轮询时长上限；
+   *  到点只停轮询，已发卡片仍可点按（点按时重新读屏校验） */
+  questionWatchSec: 1800,
   /** 同时挂起的确认请求数上限，超出后直接放行走本地流程 */
   maxPending: 16,
   /** hook 客户端访问 daemon 的共享密钥，设置后 /hook/*、/notify 需带 Bearer 头 */
@@ -117,6 +120,7 @@ export function loadConfig(explicit = {}) {
   cfg.wsPingTimeoutSec = Number(cfg.wsPingTimeoutSec) || DEFAULTS.wsPingTimeoutSec;
   cfg.timeoutSec = Math.min(Number(cfg.timeoutSec) || DEFAULTS.timeoutSec, 580);
   cfg.maxPending = Number(cfg.maxPending) || DEFAULTS.maxPending;
+  cfg.questionWatchSec = Number(cfg.questionWatchSec) || DEFAULTS.questionWatchSec;
   // bindings 规整：每条必须同时配置 chatId（oc_ 开头）与 cwd（绝对路径），
   // 配错/配漏的条目不进入运行时绑定，问题集中收集到 bindingErrors，由
   // validateServeConfig 在 serve/test 启动时直接报错退出（hook 客户端不受影响）。

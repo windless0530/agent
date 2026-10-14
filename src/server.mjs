@@ -13,9 +13,11 @@ import {
   buildNotifyCard,
   buildPromptMirrorCard,
   buildTaskResultCard,
+  buildQuestionCard,
+  buildQuestionResultCard,
 } from './cards.mjs';
 import { findAgentBySession, readPane, sendKeys as herdrSendKeys } from './herdr.mjs';
-import { parseDialogOptions, dialogHasAutoRow } from './dialog.mjs';
+import { parseDialogOptions, dialogHasAutoRow, parseChoiceDialog, choiceDialogKey } from './dialog.mjs';
 import { getUserAccessToken } from './auth.mjs';
 import { createBridgeState } from './state.mjs';
 
@@ -43,6 +45,12 @@ const permissionrequestDeny = (reason) => ({
     decision: { behavior: 'deny', message: reason },
   },
 });
+
+/** 在终端渲染「编号选择题」对话框、但不触发 PermissionRequest 的交互工具
+ *  （AskUserQuestion：计划模式提问/澄清提问，多问题逐题渲染 + 末尾复审框；
+ *  ExitPlanMode：计划审批）。PreToolUse hook（matcher 见 QUESTION_MATCHER）只当
+ *  触发器：立即放行，daemon 读屏发卡，点卡代答（见「选择题/计划审批卡」段）。 */
+const QUESTION_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
 
 /**
  * 从输入的 permission_suggestions 里挑「添加允许规则」的建议。
@@ -196,7 +204,12 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
     if (choice) resultMeta.choice = choice;
     if (act === 'always') resultMeta.summary = { ...meta.summary, __ruleHint: describeRule(ruleOf(meta)) };
     messenger
-      .updateCard(messageId, buildResultCard(resultMeta, { act, operator }))
+      .updateCard(
+        messageId,
+        meta.kind === 'question'
+          ? buildQuestionResultCard(resultMeta, { act, operator, choice })
+          : buildResultCard(resultMeta, { act, operator }),
+      )
       .catch((e) => log('error', '更新结果卡片失败:', e.message));
   }
 
@@ -212,7 +225,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
 
   async function readDialogOnce(sessionId) {
     try {
-      return paneReader ? await paneReader(sessionId) : await readDialogText(sessionId);
+      return paneReader ? await paneReader(sessionId) : await readScreen(sessionId);
     } catch {
       return '';
     }
@@ -276,16 +289,360 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
   }
 
   /** 该会话新确认到达时清算旧代答卡：框已不在（旧确认被本地处理掉）→ 翻灰；
-   *  框还在（并行确认/新框未渲染）→ 留给点卡时的读屏校验或 Stop 兜底。 */
+   *  框还在（并行确认/新框未渲染）→ 留给点卡时的读屏校验或 Stop 兜底。
+   *  提问卡与权限卡各按自己的解析器判「框还在不在」。 */
   async function sweepDialogPendings(sessionId, excludeRid) {
     if (!sessionId) return;
     const olds = [...pending.entries()].filter(
       ([rid, e]) => rid !== excludeRid && !e.settled && !e.dialog?.answering && e.dialog?.session === sessionId,
     );
     if (!olds.length) return;
-    if (parseDialogOptions(await readDialogOnce(sessionId)).length) return;
-    for (const [rid] of olds) settle(rid, { act: 'local' });
-    log('resolve', `会话 ${shortId(sessionId)} 的 ${olds.length} 张旧确认卡所对框已不在，翻为已在终端处理`);
+    const text = await readDialogOnce(sessionId);
+    const permAlive = parseDialogOptions(text).length > 0;
+    const choiceAlive = !!parseChoiceDialog(text);
+    let swept = 0;
+    for (const [rid, e] of olds) {
+      const alive = e.meta.kind === 'question' ? choiceAlive : permAlive;
+      if (!alive) {
+        settle(rid, { act: 'local' });
+        swept++;
+      }
+    }
+    if (swept) log('resolve', `会话 ${shortId(sessionId)} 的 ${swept} 张旧卡片所对框已不在，翻为已在终端处理`);
+  }
+
+  // ---------- 选择题 / 计划审批卡（AskUserQuestion / ExitPlanMode） ----------
+  // 这两类工具在终端渲染「编号选择题」对话框无限等待，且不触发 PermissionRequest
+  // （权限 hook 完全看不见它们）。PreToolUse hook（matcher QUESTION_MATCHER）只当
+  // 触发器：daemon 立即放行，起一个读屏观察器轮询 pane——屏上每出现一个新对话框
+  // 就发一张可点按的卡（一题一卡；计划审批一卡）；点卡走与权限代答完全相同的
+  // 「读屏验框 → 方向键/Enter/Space/Esc」路径，任何对不上都不硬按。
+  // PostToolUse（同一 matcher）带回答案，负责收尾翻卡与停表。复审框
+  // （Submit answers/Cancel）在答案全部来自卡片代答时自动提交——它只是用户已给
+  // 答案的纯确认，无新信息；有终端本地作答则照常发卡让用户过目。
+
+  const watchers = new Map(); // session_id -> 观察器（会话同一时刻只有一个交互工具在等）
+
+  function stopWatcher(sessionId, reason) {
+    const w = watchers.get(sessionId);
+    if (!w) return;
+    w.stopped = true;
+    clearTimeout(w.timer);
+    watchers.delete(sessionId);
+    log('watch', `会话 ${shortId(sessionId)} 选择框观察结束（${reason}）`);
+  }
+
+  /** 读 pane 当前可见文本（原始）：paneReader 优先（测试桩），否则 herdr agent read */
+  async function readScreen(sessionId) {
+    try {
+      if (paneReader) return await paneReader(sessionId);
+      const pane = (await findAgentBySession(sessionId))?.pane_id;
+      return pane ? await readPane(pane) : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function schedulePoll(w, delayMs) {
+    if (w.stopped) return;
+    const capMs = (Number(cfg.questionWatchSec) > 0 ? Number(cfg.questionWatchSec) : 1800) * 1000;
+    if (Date.now() - w.startedAt > capMs) {
+      w.stopped = true;
+      watchers.delete(w.sid);
+      log('watch', `会话 ${shortId(w.sid)} 观察超时停止（已发卡片仍可点按，点按时读屏校验）`);
+      return;
+    }
+    w.timer = setTimeout(() => {
+      w.timer.unref?.();
+      pollWatcher(w).catch((e) => log('error', '选择框观察异常:', e.message));
+    }, delayMs);
+    w.timer.unref?.();
+  }
+
+  /** 观察一次：新对话框 → 发卡；复审框满足条件 → 自动提交；连续 3 拍无框 → 停表收尾 */
+  async function pollWatcher(w) {
+    if (w.stopped) return;
+    const dialog = parseChoiceDialog(await readScreen(w.sid));
+    if (!dialog) {
+      w.missing++;
+      if (w.missing >= 3 && w.sent > 0) {
+        // 对话框序列结束但 PostToolUse 没到（hook 丢失等）：兜底结算挂起的提问卡
+        const live = [...pending.entries()].filter(
+          ([, e]) => !e.settled && e.meta.kind === 'question' && e.meta.session === w.sid,
+        );
+        for (const [rid] of live) settle(rid, { act: 'local' });
+        if (live.length) log('resolve', `选择框已消失且无 PostToolUse，${live.length} 张提问卡按已在终端处理收尾`);
+        stopWatcher(w.sid, '选择框已不在');
+        return;
+      }
+      schedulePoll(w, w.missing > 10 ? 4000 : 1500);
+      return;
+    }
+    w.missing = 0;
+    const key = choiceDialogKey(dialog.question);
+    const hasLiveCard = [...pending.values()].some(
+      (e) => !e.settled && e.meta.kind === 'question' && e.dialog.key === key,
+    );
+    if (hasLiveCard) {
+      schedulePoll(w, 1500); // 当前框的卡还挂着
+      return;
+    }
+    // 复审框 + 答案全部来自卡片代答 → 自动提交（纯确认）；否则照常发卡
+    if (dialog.kind === 'review' && w.cardAnswers > 0 && !w.seen.has(`${key}:auto`)) {
+      w.seen.add(`${key}:auto`);
+      log('watch', `复审框出现且已全部经卡片代答，自动提交（Enter）`);
+      if (await sendKeysOf(w.pane, 'Enter')) {
+        schedulePoll(w, 1200); // 等下一个对话框（如 ExitPlanMode）或消失
+        return;
+      }
+      // Enter 发失败 → 落到发卡分支，让用户手动点
+    }
+    await sendQuestionCard(w, dialog, key);
+    schedulePoll(w, 1500);
+  }
+
+  /** 按读屏所得对话框发一张提问/审批卡；问题文本与 hook payload 配对补全干净描述 */
+  async function sendQuestionCard(w, dialog, key) {
+    if (pending.size >= cfg.maxPending) {
+      log('busy', `挂起请求已达上限 ${cfg.maxPending}，提问卡不发（点按现有卡片或回终端处理）`);
+      return;
+    }
+    const q = w.questions.find((x) => choiceDialogKey(x.question) === key) || null;
+    // 与 payload 配对成功：剥掉终端追加的元选项行（"3. Type something." /
+    // "4. Chat about this"），label/desc 用 payload 的干净文本
+    let options = dialog.options;
+    if (q && Array.isArray(q.options) && q.options.length && q.options.length <= options.length) {
+      options = options.slice(0, q.options.length).map((o, i) => ({
+        ...o,
+        label: q.options[i]?.label || o.label,
+        desc: q.options[i]?.description || o.desc,
+      }));
+    }
+    const plan = dialog.kind === 'plan';
+    const rid = crypto.randomUUID();
+    let messageId;
+    try {
+      messageId = await sendCardRouted(
+        w.cwd,
+        buildQuestionCard({
+          rid,
+          tool: w.tool,
+          session: w.sid,
+          cwd: w.cwd,
+          question: q?.question || dialog.question,
+          header: q?.header || (plan ? '计划审批' : ''),
+          options,
+          multi: !!(q?.multiSelect || options.some((o) => o.checked !== undefined)),
+          plan,
+          planBody: plan ? String(w.input?.plan || '') : '',
+          planPath: plan ? String(w.input?.planFilePath || '') : '',
+        }),
+      );
+    } catch (e) {
+      log('error', '发送提问卡失败:', e.message);
+      return;
+    }
+    if (!messageId) {
+      log('route', `cwd ${w.cwd || '(空)'} 未命中任何 binding，提问卡不发`);
+      return;
+    }
+    w.sent++;
+    w.seen.add(key);
+    pending.set(rid, {
+      res: null,
+      messageId,
+      settled: false,
+      timer: null,
+      dialog: {
+        pane: w.pane,
+        session: w.sid,
+        answering: false,
+        key,
+        question: q?.question || dialog.question,
+        options,
+        plan,
+        toggled: [],
+      },
+      meta: {
+        rid,
+        kind: 'question',
+        tool: w.tool,
+        input: w.input,
+        summary: { headline: plan ? '计划待审批' : q?.header || 'Claude 提问', detail: '' },
+        cwd: w.cwd,
+        session: w.sid,
+        event: 'pretooluse',
+        question: q?.question || dialog.question,
+        header: q?.header || (plan ? '计划审批' : ''),
+        plan,
+        suggestions: [],
+        options: [],
+      },
+    });
+    log('card', `提问卡 ${rid.slice(0, 8)}（${plan ? '计划审批' : dialog.kind}·${dialog.options.length} 选项）message_id=${messageId}`);
+  }
+
+  /** 点提问/审批卡 → 读屏验框后代答。q-opt=单选（Down×n+Enter）、q-toggle=多选勾选
+   *  （Down×n+Space，卡保持可点）、q-submit=多选提交（Enter）、q-deny=取消（Esc）。
+   *  框不在/问题对不上/发键失败一律不硬按，翻灰提示回终端。 */
+  async function answerQuestionViaKeys(rid, entry, { act, opt, operator }) {
+    const { pane, session } = entry.dialog;
+    const dialog = parseChoiceDialog(await readScreen(session));
+    if (!dialog) {
+      log('resolve', rid, entry.meta.tool, 'act=local（点卡时选择框已不在）');
+      return settle(rid, { act: 'local', operator });
+    }
+    if (choiceDialogKey(dialog.question) !== entry.dialog.key) {
+      log('resolve', rid, entry.meta.tool, 'act=changed（终端问题与卡片不一致，未代答）');
+      return settle(rid, { act: 'changed', operator });
+    }
+    const opts = dialog.options;
+    const cursorIdx = Math.max(
+      0,
+      opts.findIndex((o) => o.cursor),
+    );
+    const targetIdx = opts.findIndex((o) => o.n === opt);
+    const keys = [];
+    if (act === 'q-deny') keys.push('Escape');
+    else if (act === 'q-submit') keys.push('Enter');
+    else if (targetIdx < 0) {
+      log('resolve', rid, entry.meta.tool, `act=changed（选项 ${opt} 已不在，未代答）`);
+      return settle(rid, { act: 'changed', operator });
+    } else {
+      // 目标在光标上方用 Up、下方用 Down（差 0 不动）；差值按屏幕顺序算
+      const diff = targetIdx - cursorIdx;
+      for (let i = 0; i < Math.abs(diff); i++) keys.push(diff > 0 ? 'Down' : 'Up');
+      keys.push(act === 'q-toggle' ? 'Space' : 'Enter');
+    }
+    entry.dialog.answering = true; // 代答进行中不被 PostToolUse/Stop 抢答成本地处理
+    for (const k of keys) {
+      if (!(await sendKeysOf(pane, k))) {
+        entry.dialog.answering = false;
+        log('resolve', rid, entry.meta.tool, `act=changed（发键 ${k} 失败，未代答）`);
+        return settle(rid, { act: 'changed', operator });
+      }
+      await new Promise((r) => setTimeout(r, 80)); // 按键间隔，给终端渲染留时间
+    }
+    // 多选勾选：框不消失，复验仍是同一题 → 更新勾选标记，卡片保持可点（不结算）
+    if (act === 'q-toggle') {
+      await new Promise((r) => setTimeout(r, 400));
+      const again = parseChoiceDialog(await readScreen(session));
+      entry.dialog.answering = false;
+      if (!again || choiceDialogKey(again.question) !== entry.dialog.key) {
+        return settle(rid, { act: 'local', operator });
+      }
+      const t = entry.dialog.toggled;
+      entry.dialog.toggled = t.includes(opt) ? t.filter((x) => x !== opt) : [...t, opt];
+      await messenger
+        .updateCard(
+          entry.messageId,
+          buildQuestionCard({
+            rid: entry.meta.rid,
+            tool: entry.meta.tool,
+            session,
+            cwd: entry.meta.cwd,
+            question: entry.meta.question,
+            header: entry.meta.header,
+            options: entry.dialog.options,
+            multi: true,
+            toggled: entry.dialog.toggled,
+          }),
+        )
+        .catch((e) => log('error', '更新提问卡勾选状态失败:', e.message));
+      log('card', `提问卡 ${rid.slice(0, 8)} 勾选 ${opt}（已选 ${entry.dialog.toggled.length}）`);
+      return;
+    }
+    // 单选提交/取消：复验框消失或换到下一题（key 变了 = 本题完成）
+    for (const delay of [500, 800]) {
+      await new Promise((r) => setTimeout(r, delay));
+      const again = parseChoiceDialog(await readScreen(session));
+      if (!again || choiceDialogKey(again.question) !== entry.dialog.key) {
+        entry.dialog.answering = false;
+        if (act === 'q-deny') return settle(rid, { act: 'deny', operator });
+        const w = watchers.get(session);
+        if (w) w.cardAnswers++;
+        const label =
+          act === 'q-submit'
+            ? entry.dialog.toggled
+                .map((n) => opts.find((o) => o.n === n)?.label)
+                .filter(Boolean)
+                .join('、')
+            : opts[targetIdx]?.label || '';
+        return settle(rid, { act: 'q-answered', operator, choice: { label } });
+      }
+    }
+    entry.dialog.answering = false;
+    log('resolve', rid, entry.meta.tool, 'act=changed（代答后选择框仍在，请在终端处理）');
+    return settle(rid, { act: 'changed', operator });
+  }
+
+  /** PostToolUse（AskUserQuestion/ExitPlanMode）：工具已作答/审批完毕 → 停表 +
+   *  用 tool_response 里的答案把该会话剩余提问卡逐张收尾（比泛化 local 更有信息量） */
+  function settleQuestionsFromPostToolUse(payload) {
+    const sid = payload.session_id;
+    stopWatcher(sid, `PostToolUse ${payload.tool_name}`);
+    const raw = payload.tool_response;
+    const text =
+      typeof raw === 'string'
+        ? raw
+        : typeof raw?.content === 'string'
+          ? raw.content
+          : Array.isArray(raw?.content)
+            ? raw.content.map((c) => c?.text || '').join(' ')
+            : '';
+    const pairs = [...String(text).matchAll(/"([^"]+)"\s*=\s*"([^"]*)"/g)].map((m) => [m[1], m[2]]);
+    const planApproved = /approved your plan/i.test(text);
+    const live = [...pending.entries()].filter(
+      ([, e]) => !e.settled && !e.dialog?.answering && e.meta.kind === 'question' && e.meta.session === sid,
+    );
+    for (const [rid, e] of live) {
+      const answer = pairs.find(([q]) => choiceDialogKey(q) === e.dialog.key)?.[1] || '';
+      settle(rid, { act: 'answers', operator: null, choice: { label: answer || (planApproved ? '计划已批准' : '') } });
+    }
+    if (live.length) {
+      log('resolve', `PostToolUse ${payload.tool_name}：会话 ${shortId(sid)} 的 ${live.length} 张提问/审批卡已收尾`);
+    }
+  }
+
+  /** PreToolUse（AskUserQuestion|ExitPlanMode）：立即放行 + 起观察器读屏发卡 */
+  async function handleQuestion(req, res, payload) {
+    sendJson(res, 200, ''); // 永不阻塞 hook：CLI 本地渲染对话框无限等待，卡随时可点
+    if (!chat?.chatForCwd(payload.cwd)?.chatId) {
+      log('route', `cwd ${payload.cwd || '(空)'} 未命中任何 binding，选择框不观察不发卡`);
+      return;
+    }
+    let pane = null;
+    try {
+      pane = paneResolver
+        ? await paneResolver(payload.session_id)
+        : (await findAgentBySession(payload.session_id))?.pane_id || null;
+    } catch {
+      pane = null;
+    }
+    if (!pane) {
+      log('route', `会话 ${shortId(payload.session_id)} 无 herdr pane（远程/无头），选择框无法代答，跳过`);
+      return;
+    }
+    // CLI 对话框是模态的：同会话新调用直接接管观察（旧卡保持可点，点时读屏校验）
+    stopWatcher(payload.session_id, '新的交互工具调用');
+    const w = {
+      sid: payload.session_id,
+      pane,
+      tool: payload.tool_name,
+      cwd: payload.cwd,
+      input: payload.tool_input || {},
+      questions: Array.isArray(payload.tool_input?.questions) ? payload.tool_input.questions : [],
+      seen: new Set(),
+      cardAnswers: 0,
+      missing: 0,
+      sent: 0,
+      startedAt: Date.now(),
+      timer: null,
+      stopped: false,
+    };
+    watchers.set(payload.session_id, w);
+    log('watch', `会话 ${shortId(w.sid)} 开始观察选择框（${w.tool}，pane=${pane}）`);
+    schedulePoll(w, 600); // 首拍给 CLI 渲染留时间
   }
 
   // ---------- 终端本地作答感知 ----------
@@ -313,6 +670,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
       ([, e]) =>
         !e.settled &&
         !e.dialog?.answering && // 代答进行中：按键放行的工具运行不该抢答成「本地允许」
+        e.meta.kind !== 'question' && // 提问卡由 settleQuestionsFromPostToolUse 带答案收尾
         e.meta.session === sid &&
         e.meta.tool === payload.tool_name &&
         canonicalJson(e.meta.input) === canonicalJson(payload.tool_input),
@@ -325,6 +683,7 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
   function settleLocalFromStop(payload) {
     const sid = payload.session_id;
     if (!sid) return 0;
+    stopWatcher(sid, 'Stop');
     const matches = [...pending.entries()].filter(
       ([, e]) => !e.settled && !e.dialog?.answering && e.meta.session === sid,
     );
@@ -398,9 +757,8 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
    *  隔 300/800ms 重试；pane 不存在（非 herdr 会话 / 远程机器）直接空。 */
   async function readDialogText(sessionId) {
     try {
-      const agent = await findAgentBySession(sessionId);
-      const pane = agent?.pane_id;
-      if (!pane) return '';
+      const pane = (await findAgentBySession(sessionId))?.pane_id;
+      if (!pane) return ''; // 非 herdr 会话 / 远程机器：读不到也不重试（别拖慢发卡）
       for (const delay of [0, 300, 800]) {
         if (delay) await new Promise((r) => setTimeout(r, delay));
         const text = await readPane(pane);
@@ -575,8 +933,14 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
         /waiting for your input/i.test(String(payload.message || ''));
       const stoppedRecently =
         Date.now() - (recentStop.get(payload.session_id) || 0) < 600_000;
-      if (idle && (payload.__fromChat === 1 || (payload.session_id && stoppedRecently))) {
-        log('notify', `抑制 idle_prompt 通知（会话 ${shortId(payload.session_id || '')} 已有回合输出卡）`);
+      // 提问/审批卡还挂着 = 已有可点按的卡片在提醒，同会话的空闲通知纯重复，一并抑制
+      const hasQuestionCard =
+        payload.session_id &&
+        [...pending.values()].some(
+          (e) => !e.settled && e.meta.kind === 'question' && e.meta.session === payload.session_id,
+        );
+      if (idle && (payload.__fromChat === 1 || (payload.session_id && stoppedRecently) || hasQuestionCard)) {
+        log('notify', `抑制 idle_prompt 通知（会话 ${shortId(payload.session_id || '')} 已有回合输出/提问卡）`);
         return sendJson(res, 200, '');
       }
       // permission_prompt 类通知在确认框闲置 ~6s 后才触发：此时若该会话已有挂起的
@@ -732,6 +1096,15 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
     }
 
     const { meta } = pending.get(rid);
+    // 提问/审批卡：读屏验框后代答（单选/多选勾选/提交/取消），不走 hook 连接
+    if (meta.kind === 'question') {
+      const entry = pending.get(rid);
+      if (entry.dialog.answering) {
+        log('card-cb', `忽略点击：${rid.slice(0, 8)} 代答进行中`);
+        return;
+      }
+      return answerQuestionViaKeys(rid, entry, { act, opt: Number(value.opt) || 0, operator });
+    }
     if (act === 'always') addRuleFromRequest(meta);
 
     // suggest / auto：点的是与终端确认框对应的选项，其 updates 原样回传给 Claude Code
@@ -833,10 +1206,18 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
       if (req.method === 'POST' && url.pathname.startsWith('/hook/')) {
         const payload = await readBody(req);
         const event = url.pathname.slice('/hook/'.length).toLowerCase();
+        if (event === 'pretooluse' && QUESTION_TOOLS.has(payload.tool_name)) {
+          return await handleQuestion(req, res, payload);
+        }
         if (event === 'pretooluse' || event === 'permissionrequest') {
           return await handleConfirmation(req, res, payload, event);
         }
         if (event === 'posttooluse') {
+          // 选择题类工具已作答：停表 + 用答案收尾提问卡
+          if (QUESTION_TOOLS.has(payload.tool_name)) {
+            settleQuestionsFromPostToolUse(payload);
+            return sendJson(res, 200, '');
+          }
           // 工具已执行 = 对应确认在终端被本地允许：结算挂起卡（不发通知卡）
           const n = settleLocalFromPostToolUse(payload);
           if (n) log('resolve', `PostToolUse：${payload.tool_name} 已在终端允许，结算挂起确认`);
@@ -880,6 +1261,12 @@ export function createBridge({ cfg, messenger, chat = null, bridgeState = null, 
       state.wsStatusProvider = fn;
     },
     pendingSize: () => pending.size,
+    /** 停掉全部选择框观察器（测试收尾用；观察器自身带超时上限） */
+    stopWatchers: () => {
+      for (const sid of [...watchers.keys()]) stopWatcher(sid, 'stopWatchers');
+    },
+    /** 仍在观察选择框的会话 id 列表（测试/诊断用） */
+    watcherCount: () => [...watchers.keys()],
     /** 该会话是否还有挂起的确认卡（chat runner 的 blocked 注入提示据此分流文案） */
     hasPendingFor: (sid) => [...pending.values()].some((e) => !e.settled && e.meta.session === sid),
     rules: () => allowRules,

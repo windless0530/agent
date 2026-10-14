@@ -343,6 +343,114 @@ export function buildResultCard({ tool, summary, cwd, session, nativePersist, ch
   };
 }
 
+// ---------- 选择题 / 计划审批卡片（AskUserQuestion / ExitPlanMode） ----------
+
+/** 提问/审批卡的选项按钮文案（含勾选态）；沿用确认卡的按钮单行预算 */
+function questionButtonLabel(o, i, toggled, multi) {
+  const mark = multi ? (toggled.includes(o.n) ? '☑' : '☐') : '';
+  return clipLabel(`${mark ? `${mark} ` : ''}${i + 1}. ${o.label}`, BTN_TEXT_MAX);
+}
+
+/**
+ * 终端「编号选择题」对话框的飞书镜像卡：一题一卡（多问题逐题出卡），
+ * 点按走与权限代答相同的「读屏验框 → 方向键/Enter/Space/Esc」路径。
+ * options 来自读屏（[{n,label,desc,cursor,checked}]），desc 用 hook payload 的
+ * 干净描述补全（按问题文本配对）。plan=true 为 ExitPlanMode 审批卡。
+ */
+export function buildQuestionCard({ rid, tool, session, cwd, question, header = '', options = [], multi = false, plan = false, planBody = '', planPath = '', toggled = [] }) {
+  const lines = [];
+  if (header) lines.push(`**${header}**`);
+  lines.push(`**${question}**`);
+  if (plan && planBody) {
+    lines.push(truncate(planBody, 2000));
+    if (planPath) lines.push(`<font color='grey'>计划全文：\`${truncate(planPath, 160)}\`</font>`);
+  } else {
+    for (const o of options) {
+      lines.push(`**${o.n}. ${o.label}**`);
+      if (o.desc) lines.push(truncate(o.desc, 400));
+    }
+  }
+  if (cwd) lines.push(`**目录**：\`${truncate(cwd, 200)}\``);
+  if (session) lines.push(`**会话**：\`${shortId(session)}\` @ \`${hostname()}\``);
+
+  let buttons;
+  if (plan) {
+    buttons = [
+      button('1. ✅ 批准（auto 模式执行）', 'primary', { rid, act: 'q-opt', opt: 1 }),
+      button('2. ✅ 批准（手动确认编辑）', 'default', { rid, act: 'q-opt', opt: 2 }),
+      button('3. ✋ 不批，我要再改', 'danger', { rid, act: 'q-deny' }),
+    ];
+  } else if (multi) {
+    buttons = [
+      ...options.map((o, i) =>
+        button(questionButtonLabel(o, i, toggled, true), toggled.includes(o.n) ? 'primary' : 'default', { rid, act: 'q-toggle', opt: o.n }),
+      ),
+      button(`确认提交（已选 ${toggled.length}）`, 'primary', { rid, act: 'q-submit' }),
+    ];
+  } else {
+    buttons = options.map((o, i) => button(questionButtonLabel(o, i, [], false), 'default', { rid, act: 'q-opt', opt: o.n }));
+  }
+
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: plan ? '📋 计划待审批' : '❓ Claude 提问' },
+      subtitle: { tag: 'plain_text', content: header || tool },
+      template: plan ? 'blue' : 'orange',
+    },
+    body: {
+      elements: [
+        { tag: 'markdown', content: lines.join('\n') },
+        ...buttons,
+        note(`${now()} · 无超时，可随时点按（终端同步显示，先到先得）`),
+      ],
+    },
+  };
+}
+
+const QUESTION_RESULT_META = {
+  'q-answered': { title: '✅ 已代答', template: 'green' },
+  deny: { title: '✋ 已取消', template: 'grey' },
+  local: { title: '🖥️ 已在终端处理', template: 'grey' },
+  changed: { title: '⚠️ 终端选择框已变化，请在终端处理', template: 'grey' },
+  answers: { title: '🖥️ 已作答', template: 'green' },
+};
+
+/** 提问/审批卡的结果态：choice.label 为代答所选（或 PostToolUse 带回的答案） */
+export function buildQuestionResultCard({ tool, summary, cwd, session, question = '', header = '', plan = false }, { act, operator, choice }) {
+  const meta = QUESTION_RESULT_META[act] || QUESTION_RESULT_META.local;
+  const lines = [`**${plan ? '计划审批' : header || '提问'}**：${truncate(question, 120)}`];
+  if (summary?.headline && summary.headline !== 'Claude 提问' && summary.headline !== '计划待审批') {
+    lines.push(`**工具**：\`${tool}\``);
+  }
+  if (choice?.label) lines.push(`**${act === 'answers' ? '终端答案' : '所选'}**：${truncate(choice.label, 300)}`);
+  if (cwd) lines.push(`**目录**：\`${truncate(cwd, 200)}\``);
+  if (session) lines.push(`**会话**：\`${shortId(session)}\``);
+  const who = operator?.name
+    ? `${operator.name}（${shortId(operator.open_id, 12)}）`
+    : operator?.open_id
+      ? shortId(operator.open_id, 16)
+      : '';
+  if (who && ['q-answered', 'deny'].includes(act)) lines.push(`**操作人**：${who}`);
+  if (act === 'local' || act === 'answers') lines.push('该问题已在 Claude Code 终端处理，卡片按钮已失效');
+  if (act === 'changed') lines.push('点卡时终端选择框已不在或问题与卡片不一致，代答未执行，卡片按钮已失效');
+  if (act === 'deny' && plan) lines.push('已取消审批回到计划模式；修改意见可直接发到本群（会注入该会话）');
+
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: meta.title },
+      subtitle: { tag: 'plain_text', content: header || tool },
+      template: meta.template,
+    },
+    body: {
+      elements: [{ tag: 'markdown', content: lines.join('\n') }, note(`${now()} · cc-bridge`)],
+    },
+  };
+}
+
 /** 通知类卡片（Notification / Stop / 手动 notify） */
 export function buildNotifyCard({ title, message, cwd, severity = 'info' }) {
   const template = { info: 'blue', warn: 'orange', error: 'red', success: 'green' }[severity] || 'blue';
